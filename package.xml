@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<package format="3">
+    <name>frames</name>
+    <version>0.1.0</version>
+    <description>"A frames library for working with frames and coordinate system"</description>
+
+    <maintainer email="amadeus.winarto@u.nus.edu">Amadeus</maintainer>
+    <license>MIT</license>
+
+    <buildtool_depend>catkin</buildtool_depend>
+    <depend>roscpp</depend>
+</package>

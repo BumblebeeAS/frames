@@ -1,0 +1,7 @@
+CompileFlags:
+  Add: [-xc++, -Wall, -Wpedantic, -Wextra, -Werror, -Wunused-parameter]
+  Compiler: g++
+
+Diagnostics:
+  ClangTidy:
+    Add: [modernize*, clang-diagnostic-*, clang-analyzer-*, cppcoreguidelines-*]

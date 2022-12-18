@@ -1,10 +1,34 @@
 # `frames` - A Frames Library for C++
 
-## TL；DR
+`frames` is a templated **C++17** compile-time library that provides compile-time analysis of origins, frame conventions, and frames.
 
-`frames` is a compile-time enabled C++17 library that provides compile-time analysis of origins and frame conventions.
+Features:
 
-Here is a small example of a possible operations
+- Compile-time checks of frames
+- Tested against ROS TF (`rosrun tf tf_echo`)
+- Easy to use
+
+This library is *technically* a header-only library i.e. the `include` folder is sufficient for all the functionalities. However, compile-time unit tests have been added for correctness assurance.
+
+## Table of Contents
+
+- [`frames` - A Frames Library for C++](#frames---a-frames-library-for-c)
+  - [Table of Contents](#table-of-contents)
+  - [A Small Example](#a-small-example)
+  - [Coordinate System Constructs](#coordinate-system-constructs)
+    - [FrameConvention](#frameconvention)
+    - [Origin](#origin)
+    - [Frame](#frame)
+  - [Geometric Constructs](#geometric-constructs)
+    - [Rotation](#rotation)
+    - [Translation](#translation)
+    - [Position](#position)
+  - [Rotation Convention](#rotation-convention)
+  - [Other Utilities](#other-utilities)
+
+## A Small Example
+
+Here is a small example of a possible operation
 
 ```cpp
 void example_1()
@@ -27,7 +51,7 @@ void example_1()
  // static_assert(some_point_in_ned == Position<odom_ned> { 1, 2, 3 });
 
  // Compile-error: different coordinate_system given; operator== is not defined for different coordinate systems
- // static_assert(some_point_in_ned == geometry::Position<odom> { 2, 1, -3 });
+ // static_assert(some_point_in_ned == Position<odom> { 2, 1, -3 });
 
  return 0;
 }
@@ -139,7 +163,7 @@ Notes:
 
 1. For `make_rotation`, the return type is `boost::outcome_v2::result<Rotation<FrameConvention1, FrameConvention2>>`. Refer to `example_4` for how to use it.
 2. Overload 2 of `make_rotation` which takes 3 parameters takes them in degrees.
-3. Yaw Pitch Roll intrinsic rotation is used, contrary to ROS REP 103 preference. Refer to the `Rotation Convention` section for the explanation.
+3. Yaw Pitch Roll intrinsic rotation is used, contrary to [ROS REP 103](https://www.ros.org/reps/rep-0103.html#rotation-representation) preference. Refer to the [Rotation Convention](#rotation-convention) section for the explanation.
 
 ### Translation
 
@@ -180,3 +204,15 @@ Note that this means the rotation from ENU to NED can be described as follows:
 All three conventions are correct rotations transforming ENU to NED, but only 1. and 3. have the same values. Since intrinsic rotation is easier to reason about, thus option 3 is chosen i.e. yaw first, followed by pitch, followed by roll, using intrinsic rotations. This is reflected in the ordering used across the code base i.e. `YPR`.
 
 For a more detailed explanation, please refer to [this](https://dominicplein.medium.com/extrinsic-intrinsic-rotation-do-i-multiply-from-right-or-left-357c38c1abfd).
+
+## Other Utilities
+
+Due to the need for compile-time checks and the lack of `constexpr` support from the C++ Standard Library, several `constexpr` math functions are thus implemented:
+
+1. Angle converions: `rad2deg`, `deg2rad`
+2. Exponents: `exp`, `sqrt`
+3. Trigonometric functions: `sin`, `cos`, `tan`
+4. Inverse trig. functions: `asin`, `acos`, `atan`, `atan2`
+5. Miscellaneous: `abs`, `is_close`
+
+This can be separated out into a separate compile-time math library if need be. For now, however, the purpose is only to support the implementation of `frames`. All the math utility functions can be found in the `frame_utils::math` namespace.

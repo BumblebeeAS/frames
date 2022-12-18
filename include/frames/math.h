@@ -14,6 +14,7 @@
  * Modifications made:
  * 1. Stylistic changes
  * 2. Remove exceptions
+ * 3. Approximations when necessary to avoid recursion depth limit
  */
 
 namespace frame_utils::math::detail
@@ -298,6 +299,9 @@ constexpr auto acos(T x) -> double
 
 /**
  * @brief Floating-point tangent inverse function
+ *
+ * Note that this function implements an approximation-based algorithm
+ * Source: https://blasingame.engr.tamu.edu/z_zCourse_Archive/P620_18C/P620_zReference/PDF_Txt_Hst_Apr_Cmp_(1955).pdf
  *
  * @param x
  * @return T

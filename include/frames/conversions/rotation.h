@@ -46,6 +46,23 @@ template<typename FrameConvention1, typename FrameConvention2>
 }
 
 /**
+ * @brief Factory function for creating a rotation from a quaternion
+ *
+ */
+template<typename FrameConvention1, typename FrameConvention2, typename Quaternion>
+[[nodiscard]] constexpr auto make_rotation(const Quaternion& quat) noexcept
+	-> boost::outcome_v2::result<Rotation<FrameConvention1, FrameConvention2>>
+{
+	const auto results = Rotation<FrameConvention1, FrameConvention2> { quat.w, quat.x, quat.y, quat.z };
+
+	if (math::is_close(results.norm(), 0., std::numeric_limits<float>::epsilon())) {
+		return error_code::RotationConstructionErrc::NonUnitQuaternion;
+	}
+
+	return results.normalised();
+}
+
+/**
  * @brief Factory function for creating a rotation from yaw-pitch-roll angles (degrees)
  *
  */
@@ -80,10 +97,10 @@ template<typename FrameConvention1, typename FrameConvention2>
  *
  */
 template<typename FrameConvention1, typename FrameConvention2>
-[[nodiscard]] constexpr auto make_rotation(const YPR_Deg& rpy)
+[[nodiscard]] constexpr auto make_rotation(const YPR_Deg& ypr)
 	-> boost::outcome_v2::result<Rotation<FrameConvention1, FrameConvention2>>
 {
-	return make_rotation<FrameConvention1, FrameConvention2>(rpy.yaw, rpy.pitch, rpy.roll);
+	return make_rotation<FrameConvention1, FrameConvention2>(ypr.yaw, ypr.pitch, ypr.roll);
 }
 
 /**
@@ -91,11 +108,11 @@ template<typename FrameConvention1, typename FrameConvention2>
  *
  */
 template<typename FrameConvention1, typename FrameConvention2>
-[[nodiscard]] constexpr auto make_rotation(const YPR_Rad& rpy)
+[[nodiscard]] constexpr auto make_rotation(const YPR_Rad& ypr)
 	-> boost::outcome_v2::result<Rotation<FrameConvention1, FrameConvention2>>
 {
 	return make_rotation<FrameConvention1, FrameConvention2>(
-		math::rad2deg(rpy.yaw), math::rad2deg(rpy.pitch), math::rad2deg(rpy.roll)
+		math::rad2deg(ypr.yaw), math::rad2deg(ypr.pitch), math::rad2deg(ypr.roll)
 	);
 }
 

@@ -2,6 +2,7 @@
 #define FRAME_UTILS_H
 
 #include "frames/conversions/rotation.h"
+#include "frames/conversions/unsafe_conversions.h"
 #include "frames/coordinate_system/frame.h"
 #include "frames/coordinate_system/frame_convention.h"
 #include "frames/coordinate_system/geodetic/geodetic.h"

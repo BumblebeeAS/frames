@@ -1,0 +1,58 @@
+name: CI/CD
+
+on: [push, pull_request]
+
+jobs:
+  melodic_build:
+    runs-on: ubuntu-18.04
+    steps:
+      - name: Setup ROS
+        uses: ros-tooling/setup-ros@v0.3
+        with:
+          required-ros-distributions: melodic
+
+      - name: Install packages
+        run: sudo apt-get install python-catkin-tools xorg-dev libjsoncpp-dev qtbase5-dev
+
+      - name: Setup catkin workspace
+        run: source /opt/ros/melodic/setup.bash && catkin init
+
+      - name: Check out repo
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.CI_TOKEN }}
+          path: src/frames
+
+      - name: Install dependencies
+        run: source /opt/ros/melodic/setup.bash && rosdep update && rosdep install --from-paths src -i -r -y
+
+      - name: Build
+        run: source /opt/ros/melodic/setup.bash && catkin build --no-status
+  noetic_build:
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Setup ROS
+        uses: ros-tooling/setup-ros@v0.3
+        with:
+          required-ros-distributions: noetic
+
+      - name: Install packages
+        run: sudo apt-get install python3-catkin-tools xorg-dev libjsoncpp-dev qtbase5-dev
+
+      - name: Setup catkin workspace
+        run: source /opt/ros/noetic/setup.bash && catkin init
+
+      - name: Check out repo
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.CI_TOKEN }}
+          path: src/software-auv-4
+          submodules: recursive
+        # Needed because the vision/extensions submodule is private
+        continue-on-error: true
+
+      - name: Install dependencies
+        run: source /opt/ros/noetic/setup.bash && rosdep update && rosdep install --from-paths src -i -r -y
+
+      - name: Build
+        run: source /opt/ros/noetic/setup.bash && catkin build --no-status

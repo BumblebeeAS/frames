@@ -120,27 +120,27 @@ template<typename FrameConvention1, typename FrameConvention2>
 /**
  * @brief Extract yaw pitch roll angles (degrees)
  *
+ * Source: https://www.sedris.org/wg8home/Documents/WG80485.pdf
  */
 template<typename FrameConvention1, typename FrameConvention2>
 [[nodiscard]] constexpr auto to_ypr_deg(const Rotation<FrameConvention1, FrameConvention2>& rotation) -> YPR_Deg
 {
-	// yaw (z-axis rotation)
-	const auto sinr_cosp = 2 * (rotation.getW() * rotation.getX() + rotation.getY() * rotation.getZ());
-	const auto cosr_cosp = 1 - 2 * (rotation.getX() * rotation.getX() + rotation.getY() * rotation.getY());
-	const auto yaw = math::atan2(sinr_cosp, cosr_cosp);
+	// roll (x-axis rotation)
+	const auto sinr_cosp = (rotation.getW() * rotation.getX() + rotation.getY() * rotation.getZ());
+	const auto cosr_cosp = 0.5 - (rotation.getX() * rotation.getX() + rotation.getY() * rotation.getY());
+	const auto roll = math::atan2(sinr_cosp, cosr_cosp);
 
 	// pitch (y-axis rotation)
-	const auto sinp = 2 * (rotation.getW() * rotation.getY() - rotation.getZ() * rotation.getX());
-	const auto pitch = math::abs(sinp) >= 1
-	                       // use 90 degrees if out of range
-	                       ? (sinp > 0 ? math::detail::pi<double>() / 2 : -math::detail::pi<double>() / 2)
-	                       : math::asin(sinp);
+	const auto sinp = 2 * (rotation.getX() * rotation.getZ() - rotation.getW() * rotation.getY());
+	const auto pitch = math::is_close(math::abs(sinp), 1.0)
+	                       ? (sinp > 0 ? -math::detail::pi<double>() / 2 : math::detail::pi<double>() / 2)
+	                       : math::asin(-sinp);
 
-	// roll (x-axis rotation)
-	const auto siny_cosp = 2 * (rotation.getW() * rotation.getZ() + rotation.getX() * rotation.getY());
-	const auto cosy_cosp = 1 - 2 * (rotation.getY() * rotation.getY() + rotation.getZ() * rotation.getZ());
-	const auto roll = math::atan2(siny_cosp, cosy_cosp);
-	return { math::rad2deg(roll), math::rad2deg(pitch), math::rad2deg(yaw) };
+	// yaw (y-axis rotation)
+	const auto siny_cosp = (rotation.getW() * rotation.getZ() + rotation.getX() * rotation.getY());
+	const auto cosy_cosp = 0.5 - (rotation.getY() * rotation.getY() + rotation.getZ() * rotation.getZ());
+	const auto yaw = math::atan2(siny_cosp, cosy_cosp);
+	return { math::rad2deg(yaw), math::rad2deg(pitch), math::rad2deg(roll) };
 }
 
 /**
@@ -151,6 +151,6 @@ template<typename FrameConvention1, typename FrameConvention2>
 [[nodiscard]] constexpr auto to_ypr_rad(const Rotation<FrameConvention1, FrameConvention2>& rotation) -> YPR_Rad
 {
 	const auto in_deg = to_ypr_deg(rotation);
-	return { math::deg2rad(in_deg.roll), math::deg2rad(in_deg.pitch), math::deg2rad(in_deg.yaw) };
+	return { math::deg2rad(in_deg.yaw), math::deg2rad(in_deg.pitch), math::deg2rad(in_deg.roll) };
 }
 }

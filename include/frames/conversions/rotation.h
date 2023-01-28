@@ -65,6 +65,7 @@ template<typename FrameConvention1, typename FrameConvention2, typename Quaterni
 /**
  * @brief Factory function for creating a rotation from yaw-pitch-roll angles (degrees)
  *
+ * Source: https://www.sedris.org/wg8home/Documents/WG80485.pdf
  */
 template<typename FrameConvention1, typename FrameConvention2>
 [[nodiscard]] constexpr auto make_rotation(double yaw, double pitch, double roll)
@@ -82,8 +83,8 @@ template<typename FrameConvention1, typename FrameConvention2>
 	const auto sy = math::sin(yaw_rad * 0.5);
 
 	const auto results =
-		Rotation<FrameConvention1, FrameConvention2> { cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy,
-		                                               cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy };
+		Rotation<FrameConvention1, FrameConvention2> { cy * cp * cr + sy * sp * sr, cy * cp * sr - sy * sp * cr,
+		                                               cy * sp * cr + sy * cp * sr, sy * cp * cr - cy * sp * sr };
 
 	if (math::is_close(results.norm(), 0., std::numeric_limits<float>::epsilon())) {
 		return error_code::RotationConstructionErrc::NonUnitQuaternion;

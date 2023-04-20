@@ -8,8 +8,8 @@
 #include "frames/geometry/rotation.h"
 #include "frames/math.h"
 
-#include "geometry_msgs/Quaternion.h"
-#include "geometry_msgs/QuaternionStamped.h"
+#include <geometry_msgs/msg/quaternion.h>
+#include <geometry_msgs/msg/quaternion_stamped.h>
 #include "tf2/LinearMath/Quaternion.h"
 
 namespace frame_utils::geometry

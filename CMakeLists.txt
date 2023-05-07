@@ -3,11 +3,11 @@ project(
   "frames"
   VERSION 0.1.0
   DESCRIPTION
-    "A frames library for working with frames and coordinate system"
+  "A frames library for working with frames and coordinate system"
 )
 
-# set(CMAKE_CXX_STANDARD 17)
-# set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(catkin REQUIRED COMPONENTS
   roscpp
@@ -26,7 +26,7 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
 )
 
-add_compile_options(-fconstexpr-depth=4096 -Wall -Wextra)
+add_compile_options(-fconstexpr-depth=4096 -Wall -Wextra -Wpedantic -O3)
 add_library(${PROJECT_NAME} tests/src/tests.cpp)
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
 

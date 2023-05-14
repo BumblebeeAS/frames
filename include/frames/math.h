@@ -349,6 +349,8 @@ constexpr auto atan(Integral x, typename std::enable_if<std::is_integral<Integra
 /**
  * @brief Floating-point atan2 function
  *
+ * Source: https://www.dsprelated.com/showarticle/1052.php
+ *
  * @param x
  * @param y
  * @return T
@@ -358,12 +360,14 @@ constexpr auto atan2(T numerator, T denominator) -> T
 {
 	const auto y = numerator;
 	const auto x = denominator;
-	return is_close(x, 0.0) ? (is_close(y, 0.0) ? std::numeric_limits<double>::signaling_NaN()
-	                           : y > 0.0        ? static_cast<T>(detail::pi<T>() / 2.0l)
-	                                            : -static_cast<T>(detail::pi<T>() / 2.0l))
-	                        : (x > 0.0                        ? atan(y / x)
-	                           : (is_close(y, 0.0) || y >= 0) ? atan(y / x) + detail::pi<T>()
-	                                                          : atan(y / x) - detail::pi<T>());
+	return is_close(x, 0.0)  ? (is_close(y, 0.0, 0.01) ? std::numeric_limits<double>::signaling_NaN()
+	                            : y > 0.0              ? static_cast<T>(detail::pi<T>() / 2.0l)
+	                                                   : -static_cast<T>(detail::pi<T>() / 2.0l))
+	       : abs(x) > abs(y) ? x > 0.0                          ? atan(y / x)
+	                           : (is_close(y, 0.0) || y >= 0.0) ? atan(y / x) + detail::pi<T>()
+	                                                            : atan(y / x) - detail::pi<T>()
+	       : y > 0.0 ? -atan(x / y) + detail::pi<T>() / 2.0
+	                         : -atan(x / y) - detail::pi<T>() / 2.0;
 }
 
 /**

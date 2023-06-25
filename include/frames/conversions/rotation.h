@@ -153,4 +153,27 @@ template<typename FrameConvention1, typename FrameConvention2>
 	const auto in_deg = to_ypr_deg(rotation);
 	return { math::deg2rad(in_deg.yaw), math::deg2rad(in_deg.pitch), math::deg2rad(in_deg.roll) };
 }
+
+/**
+ * @brief Convert to rotation matrix
+ *
+ */
+template<typename FrameConvention1, typename FrameConvention2>
+[[nodiscard]] constexpr auto to_rotmat(const Rotation<FrameConvention1, FrameConvention2>& rotation)
+	-> std::array<std::array<double, 3>, 3>
+{
+	std::array<std::array<double, 3>, 3> results {};
+	results[0][0] = 2 * (rotation.getW() * rotation.getW() + rotation.getX() * rotation.getX()) - 1;
+	results[0][1] = 2 * (rotation.getX() * rotation.getY() - rotation.getW() * rotation.getZ());
+	results[0][2] = 2 * (rotation.getX() * rotation.getZ() + rotation.getW() * rotation.getY());
+	results[1][1] = 2 * (rotation.getW() * rotation.getW() + rotation.getY() * rotation.getY()) - 1;
+	results[1][2] = 2 * (rotation.getY() * rotation.getZ() - rotation.getW() * rotation.getX());
+	results[2][2] = 2 * (rotation.getW() * rotation.getW() + rotation.getZ() * rotation.getZ()) - 1;
+	results[1][0] = results[0][1];
+	results[2][0] = results[0][2];
+	results[2][1] = results[1][2];
+
+	return results;
+}
+
 }

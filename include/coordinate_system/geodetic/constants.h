@@ -1,5 +1,4 @@
-#ifndef FRAME_UTIlS_COORDINATE_SYSTEM_GEODETIC_CONSTANTS_H
-#define FRAME_UTIlS_COORDINATE_SYSTEM_GEODETIC_CONSTANTS_H
+#pragma once
 
 namespace frame_utils::coordinates::geodetic::constants::wgs84
 {
@@ -15,4 +14,3 @@ constexpr double e_sq = f * (2 - f);
 
 constexpr double R = a;
 } // namespace frame_utils::coordinates::geodetic::constants::wgs84
-#endif

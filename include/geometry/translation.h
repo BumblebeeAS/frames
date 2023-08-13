@@ -1,12 +1,11 @@
-#ifndef FRAME_UTILS_GEOMETRY_TRANSLATION_H
-#define FRAME_UTILS_GEOMETRY_TRANSLATION_H
+#pragma once
 
 #include <boost/type_traits/is_detected.hpp>
 #include <ostream>
 #include <type_traits>
 
 #include "coordinate_system/frame.h"
-#include "math.h"
+#include "math.hpp"
 
 namespace frame_utils::geometry {
 /**
@@ -125,4 +124,3 @@ template <typename OriginA, typename OriginB, typename FrameConvention>
 }
 
 }  // namespace frame_utils::geometry
-#endif

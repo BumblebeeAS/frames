@@ -1,11 +1,10 @@
-#ifndef FRAME_UTIlS_GEOMETRY_ROTATION_H
-#define FRAME_UTIlS_GEOMETRY_ROTATION_H
+#pragma once
 
 #include <type_traits>
 
 #include "coordinate_system/frame_convention.h"
 #include "geometry/error_code.h"
-#include "math.h"
+#include "math.hpp"
 
 namespace frame_utils::geometry {
 
@@ -233,5 +232,3 @@ constexpr auto FRDtoFLU = FLUtoFRD.inverse();
 constexpr auto FRDtoRDF = Rotation<coordinates::FRD, coordinates::RDF>{0.5, 0.5, 0.5, 0.5};
 constexpr auto RDFtoFRD = FRDtoRDF.inverse();
 }  // namespace frame_utils::geometry
-
-#endif  // FRAME_UTILS_COORDINATES_GEOMETRY_ROTATION_HPP

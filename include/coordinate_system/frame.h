@@ -1,6 +1,4 @@
-#ifndef FRAME_UTIlS_COORDINATE_SYSTEM_FRAME_H
-#define FRAME_UTIlS_COORDINATE_SYSTEM_FRAME_H
-
+#pragma once
 #include "coordinate_system/frame_convention.h"
 #include "coordinate_system/origin.h"
 
@@ -49,4 +47,3 @@ struct is_frame<Frame<Origin, FrameConvention>> : std::true_type {};
 template <typename T>
 constexpr bool is_frame_v = is_frame<T>::value;
 }  // namespace frame_utils::coordinates
-#endif

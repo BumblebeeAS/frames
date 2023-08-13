@@ -1,5 +1,4 @@
-#ifndef FRAME_UTIlS_GEOMETRY_POSITION_H
-#define FRAME_UTIlS_GEOMETRY_POSITION_H
+#pragma once
 
 // #include <ostream>
 // #include <type_traits>
@@ -14,4 +13,3 @@ template <typename Frame>
 using Position = Translation<Frame, coordinates::__ArbitraryOrigin>;
 
 }  // namespace frame_utils::geometry
-#endif  // FRAME_UTILS_COORDINATES_POSITION_H

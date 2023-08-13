@@ -1,5 +1,4 @@
-#ifndef FRAME_UTILS__COORDINATE_SYSTEM__ERROR_CODE_H_
-#define FRAME_UTILS__COORDINATE_SYSTEM__ERROR_CODE_H_
+#pragma once
 
 #include <type_traits>
 #include <boost/system/error_code.hpp>
@@ -55,5 +54,3 @@ template<>
 struct is_error_code_enum<frame_utils::geometry::error_code::RotationConstructionErrc> : std::true_type
 { };
 }
-
-#endif

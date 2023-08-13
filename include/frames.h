@@ -1,5 +1,4 @@
-#ifndef FRAME_UTILS_H
-#define FRAME_UTILS_H
+#pragma once
 
 #include "conversions/rotation.h"
 #include "conversions/unsafe_conversions.h"
@@ -8,7 +7,7 @@
 #include "coordinate_system/geodetic/geodetic.h"
 #include "geometry/position.h"
 #include "geometry/rotation.h"
-#include "math.h"
+#include "math.hpp"
 
 namespace frame_utils::coordinates {
 using geometry::Position;
@@ -66,5 +65,3 @@ constexpr auto toNed(const Geodetic& geodetic, const Geodetic& reference) -> Pos
     return toNed(toEnu(geodetic, reference));
 }
 }  // namespace frame_utils::coordinates::geodetic
-
-#endif

@@ -5,11 +5,10 @@
 #include <boost/outcome/success_failure.hpp>
 #include <limits>
 
-#include "conversions/unsafe_conversions.h"
 #include "geometry/rotation.h"
 #include "geometry_msgs/msg/quaternion.hpp"
 #include "geometry_msgs/msg/quaternion_stamped.hpp"
-#include "math.h"
+#include "math.hpp"
 #include "tf2/LinearMath/Quaternion.h"
 
 namespace frame_utils::geometry {
@@ -29,7 +28,6 @@ struct YPR_Rad {
  * @brief Factory function for creating a rotation from a quaternion
  *
  */
-namespace rotation_ns {
 template <typename FrameConvention1, typename FrameConvention2>
 [[nodiscard]] constexpr auto make_rotation(double w, double x, double y, double z) noexcept
     -> boost::outcome_v2::result<Rotation<FrameConvention1, FrameConvention2>> {
@@ -87,7 +85,6 @@ template <typename FrameConvention1, typename FrameConvention2>
 
     return results.normalised();
 }
-}  // namespace rotation_ns
 
 /**
  * @brief Factory function for creating a rotation from yaw-pitch-roll angles (degrees)

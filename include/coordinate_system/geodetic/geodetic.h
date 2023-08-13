@@ -1,5 +1,4 @@
-#ifndef FRAME_UTIlS_COORDINATE_SYSTEM_GEODETIC_GEODETIC_H
-#define FRAME_UTIlS_COORDINATE_SYSTEM_GEODETIC_GEODETIC_H
+#pragma once
 
 #include <type_traits>
 
@@ -7,7 +6,7 @@
 #include "coordinate_system/geodetic/constants.h"
 #include "coordinate_system/origin.h"
 #include "geometry/position.h"
-#include "math.h"
+#include "math.hpp"
 
 namespace frame_utils::coordinates::geodetic {
 /**
@@ -167,5 +166,3 @@ constexpr auto toEnu(geometry::Position<ecef> coords, Geodetic reference) -> geo
     return {xEast, yNorth, zUp};
 }
 }  // namespace frame_utils::coordinates::geodetic::details
-
-#endif

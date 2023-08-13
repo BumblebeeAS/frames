@@ -1,5 +1,4 @@
-#ifndef FRAME_UTIlS_COORDINATE_SYSTEM_FRAME_CONVENTION_H
-#define FRAME_UTIlS_COORDINATE_SYSTEM_FRAME_CONVENTION_H
+#pragma once
 #include <type_traits>
 
 namespace frame_utils::coordinates
@@ -56,4 +55,3 @@ template<typename T>
 constexpr bool is_convention_v = is_convention<T>::value;
 
 }
-#endif

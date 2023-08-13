@@ -1,5 +1,4 @@
-#ifndef FRAME_UTILS_COORDINATE_SYSTEM_ORIGIN_H
-#define FRAME_UTILS_COORDINATE_SYSTEM_ORIGIN_H
+#pragma once
 
 #include <type_traits>
 
@@ -41,5 +40,3 @@ struct is_origin : std::is_base_of<Origin, T>
 template<typename T>
 constexpr bool is_origin_v = is_origin<T>::value;
 }
-
-#endif // FRAME_UTILS_COORDINATE_SYSTEM_ORIGIN_H

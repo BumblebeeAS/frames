@@ -1,5 +1,4 @@
-#ifndef FRAME_UTILS_MATH_H
-#define FRAME_UTILS_MATH_H
+#pragma once
 
 #include <limits>
 #include <type_traits>
@@ -465,5 +464,3 @@ static_assert(
 );
 
 } // namespace frame_utils::math::test
-
-#endif // FRAME_UTILS_MATH_H

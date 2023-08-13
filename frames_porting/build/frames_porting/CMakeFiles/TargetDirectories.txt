@@ -1,9 +1,0 @@
-/home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting/CMakeFiles/uninstall.dir
-/home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting/CMakeFiles/frames_porting_uninstall.dir
-/home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting/CMakeFiles/test.dir
-/home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting/CMakeFiles/edit_cache.dir
-/home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting/CMakeFiles/rebuild_cache.dir
-/home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting/CMakeFiles/list_install_components.dir
-/home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting/CMakeFiles/install.dir
-/home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting/CMakeFiles/install/local.dir
-/home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting/CMakeFiles/install/strip.dir

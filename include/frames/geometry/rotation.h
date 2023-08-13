@@ -2,9 +2,9 @@
 
 #include <type_traits>
 
-#include "coordinate_system/frame_convention.h"
-#include "geometry/error_code.h"
-#include "math.hpp"
+#include "frames/coordinate_system/frame_convention.h"
+#include "frames/geometry/error_code.h"
+#include "frames/math.hpp"
 
 namespace frame_utils::geometry {
 

@@ -5,10 +5,11 @@
 #include <boost/outcome/success_failure.hpp>
 #include <limits>
 
-#include "geometry/rotation.h"
+#include "frames/geometry/rotation.h"
+#include "frames/math.hpp"
+
 #include "geometry_msgs/msg/quaternion.hpp"
 #include "geometry_msgs/msg/quaternion_stamped.hpp"
-#include "math.hpp"
 #include "tf2/LinearMath/Quaternion.h"
 
 namespace frame_utils::geometry {

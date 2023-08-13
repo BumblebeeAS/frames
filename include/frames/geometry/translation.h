@@ -4,8 +4,8 @@
 #include <ostream>
 #include <type_traits>
 
-#include "coordinate_system/frame.h"
-#include "math.hpp"
+#include "frames/coordinate_system/frame.h"
+#include "frames/math.hpp"
 
 namespace frame_utils::geometry {
 /**

@@ -2,11 +2,11 @@
 
 #include <type_traits>
 
-#include "coordinate_system/frame.h"
-#include "coordinate_system/geodetic/constants.h"
-#include "coordinate_system/origin.h"
-#include "geometry/position.h"
-#include "math.hpp"
+#include "frames/coordinate_system/frame.h"
+#include "frames/coordinate_system/geodetic/constants.h"
+#include "frames/coordinate_system/origin.h"
+#include "frames/geometry/position.h"
+#include "frames/math.hpp"
 
 namespace frame_utils::coordinates::geodetic {
 /**

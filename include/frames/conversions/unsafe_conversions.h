@@ -1,9 +1,9 @@
 #pragma once
 
-#include "conversions/rotation.h"
-#include "coordinate_system/frame.h"
-#include "coordinate_system/frame_convention.h"
-#include "geometry/rotation.h"
+#include "frames/conversions/rotation.h"
+#include "frames/coordinate_system/frame.h"
+#include "frames/coordinate_system/frame_convention.h"
+#include "frames/geometry/rotation.h"
 
 namespace frame_utils::conversions::unsafe {
 /**

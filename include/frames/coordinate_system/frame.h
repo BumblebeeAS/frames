@@ -1,6 +1,6 @@
 #pragma once
-#include "coordinate_system/frame_convention.h"
-#include "coordinate_system/origin.h"
+#include "frames/coordinate_system/frame_convention.h"
+#include "frames/coordinate_system/origin.h"
 
 namespace frame_utils::coordinates {
 /**

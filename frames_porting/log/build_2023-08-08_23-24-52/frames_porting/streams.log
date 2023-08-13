@@ -1,0 +1,9 @@
+[0.009s] Invoking command in '/home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/monkescripts/test_ros_ws/install/my_robot_controller:/opt/ros/humble /usr/bin/cmake --build /home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting -- -j16 -l16
+[0.019s] -- Configuring incomplete, errors occurred!
+[0.019s] See also "/home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting/CMakeFiles/CMakeOutput.log".
+[0.020s] [31mCMake Error at CMakeLists.txt:6 (ament_export_include_directories):
+[0.020s]   Unknown CMake command "ament_export_include_directories".
+[0.020s] 
+[0.020s] [0m
+[0.021s] gmake: *** [Makefile:226: cmake_check_build_system] Error 1
+[0.021s] Invoked command in '/home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting' returned '2': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/monkescripts/test_ros_ws/install/my_robot_controller:/opt/ros/humble /usr/bin/cmake --build /home/monkescripts/Documents/bumblebee/localisation/frames_porting/build/frames_porting -- -j16 -l16

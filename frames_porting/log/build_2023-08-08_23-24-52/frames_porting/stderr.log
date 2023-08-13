@@ -1,0 +1,5 @@
+[31mCMake Error at CMakeLists.txt:6 (ament_export_include_directories):
+  Unknown CMake command "ament_export_include_directories".
+
+[0m
+gmake: *** [Makefile:226: cmake_check_build_system] Error 1

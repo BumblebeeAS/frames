@@ -159,18 +159,53 @@ constexpr auto test_rotations() -> void
 void test_rotation_conversions()
 {
 	// Test 1: Rotation conversion from quaternion to yaw pitch roll
-	constexpr auto yaw = 90.;
-	constexpr auto pitch = 0.;
-	constexpr auto roll = 180.0;
+	{
+		constexpr auto yaw = 90.;
+		constexpr auto pitch = 0.;
+		constexpr auto roll = 180.0;
 
-	constexpr auto rotation = make_rotation<ENU, NED>(yaw, pitch, roll).value();
-	constexpr auto results = to_ypr_deg(rotation);
-	static_assert(is_close(results.yaw, yaw), "Rotation conversion fails! - Yaw");
-	static_assert(is_close(results.pitch, pitch), "Rotation conversion fails! - Pitch");
-	static_assert(is_close(results.roll, roll), "Rotation conversion fails! - Roll");
+		constexpr auto rotation = make_rotation<ENU, NED>(yaw, pitch, roll).value();
+		constexpr auto results = to_ypr_deg(rotation);
+		static_assert(is_close(results.yaw, yaw), "Rotation conversion fails! - Yaw");
+		static_assert(is_close(results.pitch, pitch), "Rotation conversion fails! - Pitch");
+		static_assert(is_close(results.roll, roll), "Rotation conversion fails! - Roll");
 
-	constexpr auto rotation2 = make_rotation<ENU, NED>(results.yaw, results.pitch, results.roll).value();
-	static_assert(rotation == rotation2, "Rotation conversion fails!");
+		constexpr auto rotation2 = make_rotation<ENU, NED>(results.yaw, results.pitch, results.roll).value();
+		static_assert(rotation == rotation2, "Rotation conversion fails!");
+	}
+
+	// Test 2: Rotation conversion from quaternion to yaw pitch roll
+	{
+		constexpr auto yaw2 = 180.;
+		constexpr auto pitch2 = 0.;
+		constexpr auto roll2 = 0.;
+
+		constexpr auto r2 = make_rotation<ENU, NED>(yaw2, pitch2, roll2).value();
+		constexpr auto results2 = to_ypr_deg(r2);
+		static_assert(is_close(results2.yaw, yaw2), "Rotation conversion fails! - Yaw");
+		static_assert(is_close(results2.pitch, pitch2), "Rotation conversion fails! - Pitch");
+		static_assert(is_close(results2.roll, roll2), "Rotation conversion fails! - Roll");
+
+		constexpr auto r2_b = make_rotation<ENU, NED>(results2.yaw, results2.pitch, results2.roll).value();
+		static_assert(r2 == r2_b, "Rotation conversion fails!");
+	}
+
+	// Test 3: Rotation conversion from quaternion to yaw pitch roll
+	{
+		constexpr auto yaw = 179.;
+		constexpr auto pitch = 0.;
+		constexpr auto roll = 180.0;
+
+		constexpr auto rotation = make_rotation<ENU, NED>(yaw, pitch, roll).value();
+		constexpr auto results = to_ypr_deg(rotation);
+
+		static_assert(is_close(results.yaw, yaw, 0.000001), "Rotation conversion fails! - Yaw");
+		static_assert(is_close(results.pitch, pitch), "Rotation conversion fails! - Pitch");
+		static_assert(is_close(results.roll, roll), "Rotation conversion fails! - Roll");
+
+		constexpr auto rotation2 = make_rotation<ENU, NED>(results.yaw, results.pitch, results.roll).value();
+		static_assert(rotation == rotation2, "Rotation conversion fails!");
+	}
 }
 
 /**

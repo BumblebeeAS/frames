@@ -22,6 +22,7 @@ include_directories(include)
 find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_auto REQUIRED)
 find_package(bb_planner_msgs REQUIRED)
+find_package(example_interfaces REQUIRED)
 find_package(rclcpp REQUIRED)
 # find_package(Boost REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -37,6 +38,7 @@ src/dest_pose_from_tf.cpp)
 ament_target_dependencies(dest_pose_from_tf
   PUBLIC
   bb_planner_msgs
+  example_interfaces
   rclcpp
   geometry_msgs
   tf2_ros

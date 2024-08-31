@@ -8,19 +8,21 @@
     <license>MIT</license>
 
     <buildtool_depend>ament_cmake_auto</buildtool_depend>
- 
+
     <depend>rclcpp</depend>
+    <depend>rclcpp_components</depend>
     <depend>geometry_msgs</depend>
     <depend>nav_msgs</depend>
+    <depend>sensor_msgs</depend>
     <depend>tf2</depend>
     <depend>tf2_ros</depend>
     <depend>tf2_geometry_msgs</depend>
     <depend version_gte="0.0.2">bb_planner_msgs</depend>
     <depend>example_interfaces</depend>
- 
+
     <test_depend>ament_lint_auto</test_depend>
     <test_depend>ament_lint_common</test_depend>
- 
+
     <export>
         <build_type>ament_cmake</build_type>
     </export>

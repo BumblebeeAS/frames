@@ -75,12 +75,6 @@ void DestPoseFromTf::srvCallBack(
 	geometry_msgs::msg::PoseStamped input_pose = request->input_pose;
 	bool should_transform_enu_ned = is_ned(dest_frame_name) != is_ned(input_pose.header.frame_id);
 
-	if (should_transform_enu_ned) {
-		// convert ned to enu or vice versa
-		// transform_msg<geometry_msgs::msg::PoseStamped>(input_pose, is_ned(dest_frame_name), true, );
-		dest_frame_name = transform_frame_name(dest_frame_name);
-	}
-
 	geometry_msgs::msg::PoseStamped dest_pose;
 	try {
 		tf_buffer_->transform(input_pose, dest_pose, dest_frame_name, tf2::durationFromSec(request->timeout));
@@ -88,17 +82,12 @@ void DestPoseFromTf::srvCallBack(
 		response->tf_success = true;
 	}
 	catch (tf2::TransformException& ex) {
-		RCLCPP_ERROR(this->get_logger(), "Failure %s\n", ex.what());
-		RCLCPP_ERROR(this->get_logger(), "Retaining input pose");
+		RCLCPP_ERROR(this->get_logger(), "Failure %s\n  Retaining input pose", ex.what());
 		response->output_pose = input_pose;
 		response->tf_success = false;
 	}
 	if (should_transform_enu_ned) {
-		// convert ned to enu or vice versa
-		transform_msg<geometry_msgs::msg::PoseStamped>(
-			response->output_pose, false, // assume final frame is non body convention
-			true
-		);
+		response->output_pose.pose.orientation = response->output_pose.pose.orientation * Q_BODY;
 	}
 }
 

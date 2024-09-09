@@ -76,6 +76,14 @@ void DestPoseFromTf::srvCallBack(
 	bool should_transform_enu_ned = is_ned(dest_frame_name) != is_ned(input_pose.header.frame_id);
 
 	geometry_msgs::msg::PoseStamped dest_pose;
+
+	if (dest_frame_name == input_pose.header.frame_id) 
+	{
+		response->output_pose = input_pose;
+		response->tf_success = true;
+		return;
+	}
+
 	try {
 		tf_buffer_->transform(input_pose, dest_pose, dest_frame_name, tf2::durationFromSec(request->timeout));
 		response->output_pose = dest_pose;

@@ -69,7 +69,7 @@ void transform_covariance(std::array<double, 36>& cov, bool body = false) {
         return;
     }
 
-    array<double, 36> transformed = {
+    std::array<double, 36> transformed = {
         cov[7], cov[6], cov[8], cov[10], cov[9], cov[11],
         cov[1], cov[0], cov[2], cov[4], cov[3], cov[5],
         cov[13], cov[12], cov[14], cov[16], cov[15], cov[17],

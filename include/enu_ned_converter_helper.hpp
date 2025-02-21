@@ -64,6 +64,23 @@ void transform_xyz(T& msg, bool body = false) {
     }
 }
 
+void transform_covariance(std::array<double, 36>& cov, bool body = false) {
+    if (body) {
+        return;
+    }
+
+    array<double, 36> transformed = {
+        cov[7], cov[6], cov[8], cov[10], cov[9], cov[11],
+        cov[1], cov[0], cov[2], cov[4], cov[3], cov[5],
+        cov[13], cov[12], cov[14], cov[16], cov[15], cov[17],
+        cov[25], cov[24], cov[26], cov[28], cov[27], cov[29],
+        cov[19], cov[18], cov[20], cov[22], cov[21], cov[23],
+        cov[31], cov[30], cov[32], cov[34], cov[33], cov[35]
+    };
+
+    cov = transformed; // NOT TESTED
+}
+
 void transform_twist(geometry_msgs::msg::Twist& msg, bool body = false) {
     transform_xyz(msg.linear, body);
     transform_xyz(msg.angular, body);
@@ -71,7 +88,7 @@ void transform_twist(geometry_msgs::msg::Twist& msg, bool body = false) {
 
 void transform_twist_with_covariance(geometry_msgs::msg::TwistWithCovariance& msg, bool body = false) {
     transform_twist(msg.twist, body);
-    // Covariance transformation is not included for simplicity
+    transform_covariance(msg.covariance, body);
 }
 
 void transform_orientation(geometry_msgs::msg::Quaternion& orientation, bool body = false, bool transform_child = true) {
@@ -123,7 +140,7 @@ void transform_path(nav_msgs::msg::Path& msg, bool is_body = true, bool transfor
 }
 
 void transform_transform(geometry_msgs::msg::Transform& msg, bool is_body = true, bool transform_child = true) {
-    transform_xyz(msg.translation, is_body);    
+    transform_xyz(msg.translation, is_body);
     transform_orientation(msg.rotation, is_body, transform_child);
 }
 
@@ -157,6 +174,7 @@ void transform_msg(T& msg, bool is_body = false, bool transform_child = false) {
         transform_twist_with_covariance(msg, is_body);
     } else if constexpr (std::is_same_v<T, geometry_msgs::msg::TwistWithCovarianceStamped>) {
         transform_twist_with_covariance(msg.twist, is_body);
+        msg.header.frame_id = transform_frame_name(msg.header.frame_id);
     } else if constexpr (std::is_same_v<T, geometry_msgs::msg::Vector3>) {
         transform_xyz(msg, is_body);
     } else if constexpr (std::is_same_v<T, geometry_msgs::msg::Vector3Stamped>) {

@@ -23,12 +23,14 @@ include_directories(
 )
 
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
 find_package(ament_cmake_auto REQUIRED)
 find_package(bb_planner_msgs REQUIRED)
 find_package(example_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(rclpy REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -100,6 +102,12 @@ install(
   DIRECTORY include/
   DESTINATION include/${PROJECT_NAME}
 )
+
+ament_python_install_package(${PROJECT_NAME})
+
+install(PROGRAMS
+  scripts/convert_to_controls_pose.py
+  DESTINATION lib/${PROJECT_NAME})
 
 # Install launch files
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME}/)

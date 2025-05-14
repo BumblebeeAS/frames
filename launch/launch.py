@@ -7,7 +7,10 @@ from launch.substitutions import LaunchConfiguration
 
 def generate_launch_description():
     ld = LaunchDescription()
-    ld.add_action(DeclareLaunchArgument("odom_frame", default_value="world"))
+    ld.add_action(DeclareLaunchArgument("controls_frame", default_value="world_ned"))
+    ld.add_action(
+        DeclareLaunchArgument("base_frame", default_value="auv4/base_link_ned")
+    )
 
     ld.add_action(
         DeclareLaunchArgument(
@@ -29,7 +32,12 @@ def generate_launch_description():
         namespace=LaunchConfiguration("namespace"),
         executable="convert_to_controls_pose.py",
         name="convert_to_controls_pose",
-        parameters=[{"controls_frame": [LaunchConfiguration("odom_frame"), "_ned"]}],
+        parameters=[
+            {
+                "controls_frame": LaunchConfiguration("controls_frame"),
+                "base_frame": LaunchConfiguration("base_frame"),
+            }
+        ],
         output="screen",
     )
     ld.add_action(convert_to_controls_pose)

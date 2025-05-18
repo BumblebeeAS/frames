@@ -44,15 +44,7 @@ class ConvertToControlsPose(Node):
             return input_pose
 
         try:
-            when = (
-                Time.from_msg(input_pose.header.stamp)
-                if input_pose.header.stamp.sec != 0
-                else self.get_clock().now()
-            )
-
-            self.get_logger().debug(
-                f"Looking up transform at time: {when.nanoseconds / 1e9:.6f} seconds"
-            )
+            self.get_logger().debug(f"Transforming pose from '{input_pose.header.frame_id}' to '{self.controls_frame}'")
 
             output_pose = self.tf_buffer.transform(
                 input_pose, self.controls_frame, Duration(seconds=timeout)
@@ -84,19 +76,12 @@ class ConvertToControlsPose(Node):
         if anchor_frame == self.base_frame:
             return original_target
 
-        when = (
-            Time.from_msg(original_target.header.stamp)
-            if original_target.header.stamp.sec != 0
-            else self.get_clock().now()
-        )
-
-        self.get_logger().debug(
-            f"Looking up static transform at time: {when.nanoseconds / 1e9:.6f} seconds"
-        )
-
         try:
+            self.get_logger().debug(f"Transforming pose from '{anchor_frame}' to '{self.base_frame}'")
+
+            # Grab latest transform from anchor frame to base frame
             transform = self.tf_buffer.lookup_transform(
-                self.base_frame, anchor_frame, when, Duration(seconds=timeout)
+                self.base_frame, anchor_frame, Time(), Duration(seconds=timeout)
             )
         except Exception as e:
             self.get_logger().error(

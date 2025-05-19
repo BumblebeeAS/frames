@@ -29,10 +29,10 @@ using PoseWithCovarianceStampedEnuNed = EnuNedRepublisher<geometry_msgs::msg::Po
 using PathEnuNed = EnuNedRepublisher<nav_msgs::msg::Path>;
 // using TwistEnuNed = EnuNedRepublisher<geometry_msgs::msg::Twist>;
 // using TwistWithCovarianceEnuNed = EnuNedRepublisher<geometry_msgs::msg::TwistWithCovariance>;
-// using TwistWithCovarianceStampedEnuNed = EnuNedRepublisher<geometry_msgs::msg::TwistWithCovarianceStamped>;
+using TwistWithCovarianceStampedEnuNed = EnuNedRepublisher<geometry_msgs::msg::TwistWithCovarianceStamped>;
 using TwistStampedEnuNed = EnuNedRepublisher<geometry_msgs::msg::TwistStamped>;
 // using Vector3EnuNed = EnuNedRepublisher<geometry_msgs::msg::Vector3>;
-// using Vector3StampedEnuNed = EnuNedRepublisher<geometry_msgs::msg::Vector3Stamped>;
+using Vector3StampedEnuNed = EnuNedRepublisher<geometry_msgs::msg::Vector3Stamped>;
 // using PointEnuNed = EnuNedRepublisher<geometry_msgs::msg::Point>;
 // using PointStampedEnuNed = EnuNedRepublisher<geometry_msgs::msg::PointStamped>;
 using ImuEnuNed = EnuNedRepublisher<sensor_msgs::msg::Imu>;
@@ -48,10 +48,10 @@ RCLCPP_COMPONENTS_REGISTER_NODE(PoseWithCovarianceStampedEnuNed)
 RCLCPP_COMPONENTS_REGISTER_NODE(PathEnuNed)
 // RCLCPP_COMPONENTS_REGISTER_NODE(TwistEnuNed)
 // RCLCPP_COMPONENTS_REGISTER_NODE(TwistWithCovarianceEnuNed)
-// RCLCPP_COMPONENTS_REGISTER_NODE(TwistWithCovarianceStampedEnuNed)
+RCLCPP_COMPONENTS_REGISTER_NODE(TwistWithCovarianceStampedEnuNed)
 RCLCPP_COMPONENTS_REGISTER_NODE(TwistStampedEnuNed)
 // RCLCPP_COMPONENTS_REGISTER_NODE(Vector3EnuNed)
-// RCLCPP_COMPONENTS_REGISTER_NODE(Vector3StampedEnuNed)
+RCLCPP_COMPONENTS_REGISTER_NODE(Vector3StampedEnuNed)
 // RCLCPP_COMPONENTS_REGISTER_NODE(PointEnuNed)
 // RCLCPP_COMPONENTS_REGISTER_NODE(PointStampedEnuNed)
 RCLCPP_COMPONENTS_REGISTER_NODE(ImuEnuNed)

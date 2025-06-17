@@ -52,7 +52,7 @@ class ConvertToControlsPose(Node):
 
     def transform_to_frame(
         self, input_pose: PoseStamped, target_frame: str, timeout: float
-    ) -> Optional[PoseStamped]:
+    ) -> PoseStamped:
         """
         Transform a pose to the specified target frame.
 
@@ -62,41 +62,34 @@ class ConvertToControlsPose(Node):
             timeout: Maximum time to wait for the transform, in seconds
 
         Returns:
-            The transformed pose if successful, None otherwise
+            The transformed pose
+
+        Raises:
+            Exception: If the transform fails
         """
         if input_pose.header.frame_id == target_frame:
             return input_pose
 
-        try:
-            self.get_logger().debug(
-                f"Transforming pose from '{input_pose.header.frame_id}' to '{target_frame}'"
-            )
+        self.get_logger().debug(
+            f"Transforming pose from '{input_pose.header.frame_id}' to '{target_frame}'"
+        )
 
-            output_pose = self.tf_buffer.transform(
-                input_pose, target_frame, Duration(seconds=timeout)
-            )
+        output_pose = self.tf_buffer.transform(
+            input_pose, target_frame, Duration(seconds=timeout)
+        )
 
-            self.get_logger().debug(
-                f"Transformed pose: position [{output_pose.pose.position.x}, "
-                f"{output_pose.pose.position.y}, {output_pose.pose.position.z}], "
-                f"orientation [{output_pose.pose.orientation.w}, {output_pose.pose.orientation.x}, "
-                f"{output_pose.pose.orientation.y}, {output_pose.pose.orientation.z}]"
-            )
+        self.get_logger().debug(
+            f"Transformed pose: position [{output_pose.pose.position.x}, "
+            f"{output_pose.pose.position.y}, {output_pose.pose.position.z}], "
+            f"orientation [{output_pose.pose.orientation.w}, {output_pose.pose.orientation.x}, "
+            f"{output_pose.pose.orientation.y}, {output_pose.pose.orientation.z}]"
+        )
 
-            return output_pose
-
-        except Exception as e:
-            self.get_logger().error(
-                f"Failed to transform pose from '{input_pose.header.frame_id}' to '{target_frame}': {str(e)}"
-            )
-            import traceback
-
-            self.get_logger().info(f"Exception traceback: {traceback.format_exc()}")
-            return None
+        return output_pose
 
     def recalculate_target(
         self, original_target: PoseStamped, anchor_frame: str, timeout: float
-    ) -> Optional[PoseStamped]:
+    ) -> PoseStamped:
         """
         Recalculate a target pose based on an anchor frame.
 
@@ -109,30 +102,24 @@ class ConvertToControlsPose(Node):
             timeout: Maximum time to wait for the transform, in seconds
 
         Returns:
-            The recalculated pose if successful, None otherwise
+            The recalculated pose
+
+        Raises:
+            Exception: If the transform lookup fails
         """
         if anchor_frame == self.base_frame:
             return original_target
 
-        try:
-            self.get_logger().debug(
-                f"Getting translation from '{anchor_frame}' to '{self.base_frame}'"
-            )
+        self.get_logger().debug(
+            f"Getting translation from '{anchor_frame}' to '{self.base_frame}'"
+        )
 
-            transform = self.tf_buffer.lookup_transform(
-                self.base_frame,
-                anchor_frame,
-                Time.from_msg(original_target.header.stamp),
-                Duration(seconds=timeout),
-            )
-        except Exception as e:
-            self.get_logger().error(
-                f"Failed to find transform from '{anchor_frame}' to '{self.base_frame}': {str(e)}"
-            )
-            import traceback
-
-            self.get_logger().debug(f"Exception traceback: {traceback.format_exc()}")
-            return None
+        transform = self.tf_buffer.lookup_transform(
+            self.base_frame,
+            anchor_frame,
+            Time.from_msg(original_target.header.stamp),
+            Duration(seconds=timeout),
+        )
 
         # Create output pose and copy original pose data
         output_pose = PoseStamped()
@@ -168,31 +155,26 @@ class ConvertToControlsPose(Node):
         response: GetPoseToControlsFrame.Response,
     ) -> GetPoseToControlsFrame.Response:
         """
-        Service callback to handle pose conversion requests.
+        Service callback to handle pose conversion requests for multiple poses.
 
-        The service performs the following steps:
+        The service performs the following steps for each input pose:
         1. Transform the input pose to the base frame
         2. Recalculate the pose if an anchor frame is specified
         3. Transform the result to the controls frame
 
         Args:
-            request: The service request containing input pose, anchor frame, and timeout
+            request: The service request containing input poses, anchor frame, and timeout
             response: The service response object to populate
 
         Returns:
-            The populated service response with output pose and success status
+            The populated service response with output poses and success status
         """
-        input_pose = request.input_pose
+        input_poses = request.input_poses
         anchor_frame = request.anchor_frame_name
         timeout = request.timeout
 
         self.get_logger().info(
-            f"Received transform request from frame '{input_pose.header.frame_id}' to '{self.controls_frame}'"
-        )
-        self.get_logger().debug(
-            f"Input pose: position [{input_pose.pose.position.x}, {input_pose.pose.position.y}, {input_pose.pose.position.z}], "
-            f"orientation [{input_pose.pose.orientation.w}, {input_pose.pose.orientation.x}, "
-            f"{input_pose.pose.orientation.y}, {input_pose.pose.orientation.z}]"
+            f"Received transform request for {len(input_poses)} poses to '{self.controls_frame}'"
         )
 
         if timeout <= 0.0:
@@ -201,32 +183,49 @@ class ConvertToControlsPose(Node):
         else:
             self.get_logger().debug(f"Using specified timeout of {timeout} seconds")
 
-        pose_in_base_frame = self.transform_to_frame(
-            input_pose, self.base_frame, timeout
-        )
-        if pose_in_base_frame is None:
-            response.output_pose = input_pose
-            response.tf_success = False
-            return response
+        output_poses = []
 
-        recalculated_pose = self.recalculate_target(
-            pose_in_base_frame, anchor_frame, timeout
-        )
-        if recalculated_pose is None:
-            response.output_pose = input_pose
-            response.tf_success = False
-            return response
+        try:
+            for i, input_pose in enumerate(input_poses):
+                self.get_logger().debug(
+                    f"Processing pose {i + 1}/{len(input_poses)} from frame '{input_pose.header.frame_id}'"
+                )
+                self.get_logger().debug(
+                    f"Input pose {i + 1}: position [{input_pose.pose.position.x}, {input_pose.pose.position.y}, {input_pose.pose.position.z}], "
+                    f"orientation [{input_pose.pose.orientation.w}, {input_pose.pose.orientation.x}, "
+                    f"{input_pose.pose.orientation.y}, {input_pose.pose.orientation.z}]"
+                )
 
-        final_pose = self.transform_to_frame(
-            recalculated_pose, self.controls_frame, timeout
-        )
-        if final_pose is None:
-            response.output_pose = input_pose
-            response.tf_success = False
-            return response
+                # Step 1: Transform input pose to base frame
+                pose_in_base_frame = self.transform_to_frame(
+                    input_pose, self.base_frame, timeout
+                )
 
-        response.output_pose = final_pose
-        response.tf_success = True
+                # Step 2: Recalculate pose based on anchor frame
+                recalculated_pose = self.recalculate_target(
+                    pose_in_base_frame, anchor_frame, timeout
+                )
+
+                # Step 3: Transform to controls frame
+                final_pose = self.transform_to_frame(
+                    recalculated_pose, self.controls_frame, timeout
+                )
+
+                output_poses.append(final_pose)
+
+            response.output_poses = output_poses
+            response.tf_success = True
+            self.get_logger().info(f"Successfully converted {len(output_poses)} poses")
+
+        except Exception as e:
+            self.get_logger().error(f"Failed to convert poses: {str(e)}")
+            import traceback
+
+            self.get_logger().debug(f"Exception traceback: {traceback.format_exc()}")
+
+            response.output_poses = input_poses
+            response.tf_success = False
+
         return response
 
 

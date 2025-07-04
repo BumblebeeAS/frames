@@ -7,15 +7,15 @@ from launch.substitutions import LaunchConfiguration
 
 def generate_launch_description():
     ld = LaunchDescription()
-    ld.add_action(DeclareLaunchArgument("controls_frame", default_value="world_ned"))
+    ld.add_action(DeclareLaunchArgument("controls_frame", default_value="map_ned"))
     ld.add_action(
-        DeclareLaunchArgument("base_frame", default_value="auv4/base_link_ned")
+        DeclareLaunchArgument("base_frame", default_value="orca4_ned")
     )
 
     ld.add_action(
         DeclareLaunchArgument(
             "namespace",
-            default_value="auv4",
+            default_value="mini",
             description="Namespace of the vehicle",
         )
     )

@@ -15,7 +15,7 @@ def generate_launch_description():
     ld.add_action(
         DeclareLaunchArgument(
             "namespace",
-            default_value="mini",
+            default_value="miniauv",
             description="Namespace of the vehicle",
         )
     )

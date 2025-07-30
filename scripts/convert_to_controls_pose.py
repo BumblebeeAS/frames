@@ -78,11 +78,12 @@ class ConvertToControlsPose(Node):
             input_pose, target_frame, Duration(seconds=timeout)
         )
 
-        self.get_logger().debug(
+        self.get_logger().info(
             f"Transformed pose: position [{output_pose.pose.position.x}, "
             f"{output_pose.pose.position.y}, {output_pose.pose.position.z}], "
             f"orientation [{output_pose.pose.orientation.w}, {output_pose.pose.orientation.x}, "
             f"{output_pose.pose.orientation.y}, {output_pose.pose.orientation.z}]"
+            f"into target frame: {target_frame}"
         )
 
         return output_pose
@@ -140,11 +141,12 @@ class ConvertToControlsPose(Node):
             original_target.pose.position.z - transform.transform.translation.z
         )
 
-        self.get_logger().debug(
+        self.get_logger().info(
             f"Recalculated target pose: position [{output_pose.pose.position.x}, "
             f"{output_pose.pose.position.y}, {output_pose.pose.position.z}], "
             f"orientation [{output_pose.pose.orientation.w}, {output_pose.pose.orientation.x}, "
             f"{output_pose.pose.orientation.y}, {output_pose.pose.orientation.z}]"
+            f"with anchor frame {anchor_frame}"
         )
 
         return output_pose
@@ -187,10 +189,10 @@ class ConvertToControlsPose(Node):
 
         try:
             for i, input_pose in enumerate(input_poses):
-                self.get_logger().debug(
+                self.get_logger().info(
                     f"Processing pose {i + 1}/{len(input_poses)} from frame '{input_pose.header.frame_id}'"
                 )
-                self.get_logger().debug(
+                self.get_logger().info(
                     f"Input pose {i + 1}: position [{input_pose.pose.position.x}, {input_pose.pose.position.y}, {input_pose.pose.position.z}], "
                     f"orientation [{input_pose.pose.orientation.w}, {input_pose.pose.orientation.x}, "
                     f"{input_pose.pose.orientation.y}, {input_pose.pose.orientation.z}]"

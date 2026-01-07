@@ -28,6 +28,7 @@ def transform_pose_to_odom(
 
     # Create transform from odom child to odom parent using odometry
     odom_transform = tf2_ros.TransformStamped()
+    odom_transform.header = odom_msg.header
     odom_transform.transform.translation.x = odom_msg.pose.pose.position.x
     odom_transform.transform.translation.y = odom_msg.pose.pose.position.y
     odom_transform.transform.translation.z = odom_msg.pose.pose.position.z

@@ -3,13 +3,23 @@ from typing import Any, Optional
 
 import rclpy
 import tf2_geometry_msgs  # noqa: F401
+import tf2_ros
 from bb_planner_msgs.srv import GetPoseToControlsFrame
 from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from rclpy.time import Time
+from tf2_geometry_msgs import do_transform_pose_stamped
+from tf2_msgs.msg import TFMessage
 from tf2_ros.buffer import Buffer
-from tf2_ros.transform_listener import TransformListener
 
 
 class ConvertToControlsPose(Node):
@@ -37,8 +47,26 @@ class ConvertToControlsPose(Node):
             self.get_parameter("base_frame").get_parameter_value().string_value
         )
 
+        static_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+
         self.tf_buffer: Buffer = Buffer()
-        self.tf_listener: TransformListener = TransformListener(self.tf_buffer, self)
+        self.tf_sub = self.create_subscription(
+            TFMessage,
+            "/tf_static",
+            self.handle_tf_static,
+            qos_profile=static_qos,
+        )
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            "/odom",
+            self.handle_odom,
+            qos_profile=qos_profile_sensor_data,
+        )
 
         self.conversion_service = self.create_service(
             GetPoseToControlsFrame,
@@ -50,9 +78,19 @@ class ConvertToControlsPose(Node):
         self.get_logger().info(f"Using controls frame: '{self.controls_frame}'")
         self.get_logger().info(f"Using base frame: '{self.base_frame}'")
 
+    def handle_tf_static(self, msg: TFMessage) -> None:
+        """
+        Callback to set static transforms in the TF buffer.
+        """
+        for tf in msg.transforms:
+            self.tf_buffer.set_transform_static(tf, "default_authority")
+
+    def handle_odom(self, msg: Odometry) -> None:
+        self.odom = msg
+
     def transform_to_frame(
         self, input_pose: PoseStamped, target_frame: str, timeout: float
-    ) -> PoseStamped:
+    ) -> PoseStamped | None:
         """
         Transform a pose to the specified target frame.
 
@@ -74,9 +112,28 @@ class ConvertToControlsPose(Node):
             f"Transforming pose from '{input_pose.header.frame_id}' to '{target_frame}'"
         )
 
-        output_pose = self.tf_buffer.transform(
-            input_pose, target_frame, Duration(seconds=timeout)
-        )
+        try:
+            target_to_input_transform = self.tf_buffer.lookup_transform(
+                target_frame=target_frame,
+                source_frame=input_pose.header.frame_id,
+                time=Time.from_msg(input_pose.header.stamp),
+                duration=Duration(seconds=timeout),  # type: ignore
+            )
+        except (
+            tf2_ros.LookupException,
+            tf2_ros.ConnectivityException,
+            tf2_ros.ExtrapolationException,
+        ) as e:
+            self.get_logger().error(f"Transform lookup failed: {e}")
+            return None
+
+        output_pose = do_transform_pose_stamped(input_pose, target_to_input_transform)
+
+        # output_pose = self.tf_buffer.transform(
+        #     input_pose,
+        #     target_frame,
+        #     Duration(seconds=timeout),  # type: ignore
+        # )
 
         self.get_logger().info(
             f"Transformed pose: position [{output_pose.pose.position.x}, "
@@ -119,7 +176,7 @@ class ConvertToControlsPose(Node):
             self.base_frame,
             anchor_frame,
             Time.from_msg(original_target.header.stamp),
-            Duration(seconds=timeout),
+            Duration(seconds=timeout),  # type: ignore
         )
 
         # Create output pose and copy original pose data
@@ -202,6 +259,14 @@ class ConvertToControlsPose(Node):
                 pose_in_base_frame = self.transform_to_frame(
                     input_pose, self.base_frame, timeout
                 )
+
+                if pose_in_base_frame is None:
+                    response.output_poses = input_poses
+                    response.tf_success = False
+                    self.get_logger().error(
+                        f"Failed to transform pose {i + 1} to base frame '{self.base_frame}'"
+                    )
+                    break
 
                 # Step 2: Recalculate pose based on anchor frame
                 recalculated_pose = self.recalculate_target(

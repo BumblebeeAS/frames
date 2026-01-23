@@ -1,8 +1,7 @@
-from launch_ros.actions import Node
-
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
 
 
 def generate_launch_description():
@@ -36,6 +35,8 @@ def generate_launch_description():
             {
                 "controls_frame": LaunchConfiguration("controls_frame"),
                 "base_frame": LaunchConfiguration("base_frame"),
+                "queue_size": 100,
+                "odom_topic": "/auv4/odom_ned",
             }
         ],
         output="screen",

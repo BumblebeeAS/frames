@@ -14,6 +14,8 @@ def generate_launch_description():
                 {
                     "controls_frame": "odom_ned",
                     "base_frame": "uav2/base_link_frd",
+                    "queue_size": 100,
+                    "odom_topic": "/uav2/odom_ned",
                 }
             ],
             output="screen",

@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-from operator import attrgetter
+from bisect import bisect_left
+from collections import deque
 from typing import Any, Optional
 
-import numpy as np
 import rclpy
 import tf2_ros
 from bb_planner_msgs.srv import GetPoseToControlsFrame
-from geometry_msgs.msg import PoseStamped, Quaternion, Transform, Vector3
+from builtin_interfaces.msg import Time
+from frames.utils.transform_ros_msgs import (
+    compose_transforms,
+    get_base_to_world_tf_stamped,
+    get_world_to_base_tf_stamped,
+)
+from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -17,56 +23,14 @@ from rclpy.qos import (
     ReliabilityPolicy,
     qos_profile_sensor_data,
 )
-from rclpy.time import Time
+from rclpy.time import Time as RclpyTime
 from tf2_geometry_msgs import do_transform_pose_stamped
 from tf2_msgs.msg import TFMessage
 from tf2_ros.buffer import Buffer
-from tf_transformations import (
-    concatenate_matrices,
-    inverse_matrix,
-    quaternion_from_matrix,
-    quaternion_inverse,
-    quaternion_matrix,
-    quaternion_multiply,
-    translation_from_matrix,
-    translation_matrix,
-    unit_vector,
-)
 
 
-def compose_transforms(f: Transform, g: Transform):
-    """
-    Given two transforms f and g, computes gf.
-    """
-
-    tf_to_quat = lambda tf: unit_vector(
-        np.array(attrgetter("x", "y", "z", "w")(tf.rotation))
-    )
-    tf_to_trans = lambda tf: np.array([*attrgetter("x", "y", "z")(tf.translation), 0.0])
-
-    g_quat = tf_to_quat(g)
-    g_trans = tf_to_trans(g)
-    f_quat = tf_to_quat(f)
-    f_trans = tf_to_trans(f)
-
-    # Note that we want gf = R_g*(R_f*x + t_f) + t_g = R_g*R_f*x + (R_g*t_f + t_g)
-    # The computations below are just the quaternion equivalents. In particular, for
-    # applying rotations to vectors, we set w = 0, and do q * v * q^-1.
-    # WESLEY DONT REMOVE THIS COMMENT
-    rot = quaternion_multiply(g_quat, f_quat)
-    trans = (
-        quaternion_multiply(
-            g_quat,
-            quaternion_multiply(f_trans, quaternion_inverse(g_quat)),
-        )
-        + g_trans
-    )
-
-    composed = Transform()
-    composed.rotation = Quaternion(x=rot[0], y=rot[1], z=rot[2], w=rot[3])
-    composed.translation = Vector3(x=trans[0], y=trans[1], z=trans[2])
-
-    return composed
+def header_time_to_seconds(header_time: Time) -> float:
+    return header_time.sec + header_time.nanosec * 1e-9
 
 
 class ConvertToControlsPose(Node):
@@ -84,24 +48,37 @@ class ConvertToControlsPose(Node):
         """
         super().__init__(name)
 
-        self.declare_parameter("controls_frame", "world_ned")
+        # ------ Declare parameters ------
         self.controls_frame: str = (
-            self.get_parameter("controls_frame").get_parameter_value().string_value
+            self.declare_parameter("controls_frame", "world_ned")
+            .get_parameter_value()
+            .string_value
         )
-
-        self.declare_parameter("base_frame", "auv4/base_link_ned")
         self.base_frame: str = (
-            self.get_parameter("base_frame").get_parameter_value().string_value
+            self.declare_parameter("base_frame", "auv4/base_link_ned")
+            .get_parameter_value()
+            .string_value
+        )
+        self.queue_size: int = (
+            self.declare_parameter("queue_size", 100)
+            .get_parameter_value()
+            .integer_value
+        )
+        self.odom_topic: str = (
+            self.declare_parameter("odom_topic", "/uav2/odom_ned")
+            .get_parameter_value()
+            .string_value
         )
 
+        # ------ Initialize subs and srv ------
         static_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
         )
-
         self.tf_buffer: Buffer = Buffer()
+        self.odom_buffer: deque[Odometry] = deque(maxlen=self.queue_size)
         self.tf_sub = self.create_subscription(
             TFMessage,
             "/tf_static",
@@ -110,11 +87,10 @@ class ConvertToControlsPose(Node):
         )
         self.odom_sub = self.create_subscription(
             Odometry,
-            "/uav2/odom_ned",
+            self.odom_topic,
             self.handle_odom,
             qos_profile=qos_profile_sensor_data,
         )
-
         self.conversion_service = self.create_service(
             GetPoseToControlsFrame,
             "convert_to_controls_pose",
@@ -124,6 +100,8 @@ class ConvertToControlsPose(Node):
         self.get_logger().info("ConvertToControlsPose service started")
         self.get_logger().info(f"Using controls frame: '{self.controls_frame}'")
         self.get_logger().info(f"Using base frame: '{self.base_frame}'")
+        self.get_logger().info(f"Using queue size: {self.queue_size}")
+        self.get_logger().info(f"Using odom topic: {self.odom_topic}")
 
     def handle_tf_static(self, msg: TFMessage) -> None:
         """
@@ -134,13 +112,104 @@ class ConvertToControlsPose(Node):
             self.tf_buffer.set_transform_static(tf, "default_authority")
 
     def handle_odom(self, msg: Odometry) -> None:
-        self.odom = msg
+        self.odom_buffer.append(msg)
+
+    def get_odom_at_time(self, time: float) -> Odometry:
+        """
+        Get the odometry message closest to the specified time.
+
+        Args:
+            time: The time to find the closest odometry for, in seconds
+
+        Returns:
+            The closest odometry message
+        """
+        idx = min(
+            bisect_left(
+                self.odom_buffer,
+                key=lambda odom: (header_time_to_seconds(odom.header.stamp)),
+                x=time,
+            ),
+            len(self.odom_buffer) - 1,
+        )
+
+        before = self.odom_buffer[max(idx - 1, 0)]
+        after = self.odom_buffer[idx]
+
+        before_time = header_time_to_seconds(before.header.stamp)
+        after_time = header_time_to_seconds(after.header.stamp)
+
+        before_time_diff = abs(before_time - time)
+        after_time_diff = abs(after_time - time)
+
+        self.get_logger().info(f"time diff (before): {before_time_diff}")
+        self.get_logger().info(f"time diff (after): {after_time_diff}")
+
+        if before_time_diff <= after_time_diff:
+            return before
+        return after
+
+    def get_transform(
+        self, target_frame: list[str], input_pose: PoseStamped, timeout: float
+    ) -> Optional[tf2_ros.TransformStamped]:
+        """
+        Get the transform from the input pose frame to the target frame.
+        """
+        is_from_base_link = False
+        target_to_input_transform = None
+
+        try:
+            target_to_input_transform = self.tf_buffer.lookup_transform(
+                target_frame=target_frame[0],
+                source_frame=input_pose.header.frame_id,
+                time=RclpyTime(seconds=0),
+                timeout=Duration(seconds=timeout),  # type: ignore
+            )
+            is_from_base_link = True
+        except (
+            tf2_ros.LookupException,  #  # type: ignore
+            tf2_ros.ConnectivityException,  # type: ignore
+            tf2_ros.ExtrapolationException,  # type: ignore
+        ) as e:
+            self.get_logger().error(f"Transform lookup failed: {e}")
+
+        if not is_from_base_link:
+            # tf is from world to input frame
+            try:
+                target_to_input_transform = self.tf_buffer.lookup_transform(
+                    target_frame=target_frame[1],
+                    source_frame=input_pose.header.frame_id,
+                    time=RclpyTime(seconds=0),
+                    timeout=Duration(seconds=timeout),  # type: ignore
+                )
+                odom = self.get_odom_at_time(
+                    header_time_to_seconds(target_to_input_transform.header.stamp)
+                )
+
+                world_to_base_tf = get_world_to_base_tf_stamped(odom, self.base_frame)
+                target_to_input_transform = compose_transforms(
+                    target_to_input_transform.transform, world_to_base_tf.transform
+                )
+                target_to_input_transform = tf2_ros.TransformStamped(
+                    header=world_to_base_tf.header,
+                    child_frame_id=input_pose.header.frame_id,
+                    transform=target_to_input_transform,
+                )
+            except (
+                tf2_ros.LookupException,  # type: ignore
+                tf2_ros.ConnectivityException,  # type: ignore
+                tf2_ros.ExtrapolationException,  # type: ignore
+            ) as e:
+                self.get_logger().error(f"Transform lookup failed: {e}")
+                return None
+
+        return target_to_input_transform
 
     def transform_to_frame(
         self, input_pose: PoseStamped, target_frame: list[str], timeout: float
-    ) -> PoseStamped | None:
+    ) -> Optional[PoseStamped]:
         """
-        Transform a pose to the specified target frame.
+        Transform a pose to the specified target_frame[0].
 
         Args:
             input_pose: The pose to transform
@@ -153,62 +222,23 @@ class ConvertToControlsPose(Node):
         Raises:
             Exception: If the transform fails
         """
-        if input_pose.header.frame_id == target_frame:
+        if input_pose.header.frame_id == target_frame[0]:
             return input_pose
 
-        is_from_base_link = False
         self.get_logger().debug(
-            f"Transforming pose from '{input_pose.header.frame_id}' to '{target_frame}'"
+            f"Transforming pose from '{input_pose.header.frame_id}' to '{target_frame[0]}'"
         )
-        try:
-            target_to_input_transform = self.tf_buffer.lookup_transform(
-                target_frame=target_frame[0],
-                source_frame=input_pose.header.frame_id,
-                time=Time.from_msg(input_pose.header.stamp),
-                timeout=Duration(seconds=timeout),  # type: ignore
-            )
-            is_from_base_link = True
-        except (
-            tf2_ros.LookupException,
-            tf2_ros.ConnectivityException,
-            tf2_ros.ExtrapolationException,
-        ) as e:
-            self.get_logger().error(f"Transform lookup failed: {e}")
+        self.target_to_input_transform = self.get_transform(
+            target_frame, input_pose, timeout
+        )
 
-        if not is_from_base_link:
-            # tf is from world to input frame
-            try:
-                target_to_input_transform = self.tf_buffer.lookup_transform(
-                    target_frame=target_frame[1],
-                    source_frame=input_pose.header.frame_id,
-                    time=Time.from_msg(input_pose.header.stamp),
-                    timeout=Duration(seconds=timeout),  # type: ignore
-                )
-                world_to_base_tf = self.get_world_to_base_tf_stamped()
-                target_to_input_transform = compose_transforms(
-                    target_to_input_transform.transform, world_to_base_tf.transform
-                )
-                target_to_input_transform = tf2_ros.TransformStamped(
-                    header=world_to_base_tf.header,
-                    child_frame_id=input_pose.header.frame_id,
-                    transform=target_to_input_transform,
-                )
-            except (
-                tf2_ros.LookupException,
-                tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException,
-            ) as e:
-                self.get_logger().error(f"Transform lookup failed: {e}")
-                return None
+        if self.target_to_input_transform is None:
+            self.get_logger().error("Failed to obtain target_to_input_transform.")
+            return None
 
-        output_pose = do_transform_pose_stamped(input_pose, target_to_input_transform)
-
-        # output_pose = self.tf_buffer.transform(
-        #     input_pose,
-        #     target_frame,
-        #     Duration(seconds=timeout),  # type: ignore
-        # )
-
+        output_pose = do_transform_pose_stamped(
+            input_pose, self.target_to_input_transform
+        )
         self.get_logger().info(
             f"Transformed pose: position [{output_pose.pose.position.x}, "
             f"{output_pose.pose.position.y}, {output_pose.pose.position.z}], "
@@ -249,7 +279,6 @@ class ConvertToControlsPose(Node):
         transform = self.tf_buffer.lookup_transform(
             self.base_frame,
             anchor_frame,
-            Time.from_msg(original_target.header.stamp),
             Duration(seconds=timeout),  # type: ignore
         )
 
@@ -306,6 +335,11 @@ class ConvertToControlsPose(Node):
         anchor_frame = request.anchor_frame_name
         timeout = request.timeout
 
+        response.tf_success = False
+        response.output_poses = input_poses
+
+        output_poses = []
+
         self.get_logger().info(
             f"Received transform request for {len(input_poses)} poses to '{self.controls_frame}'"
         )
@@ -315,8 +349,6 @@ class ConvertToControlsPose(Node):
             self.get_logger().debug(f"Using default timeout of {timeout} seconds")
         else:
             self.get_logger().debug(f"Using specified timeout of {timeout} seconds")
-
-        output_poses = []
 
         try:
             for i, input_pose in enumerate(input_poses):
@@ -335,12 +367,13 @@ class ConvertToControlsPose(Node):
                 )
 
                 if pose_in_base_frame is None:
-                    response.output_poses = input_poses
-                    response.tf_success = False
                     self.get_logger().error(
                         f"Failed to transform pose {i + 1} to base frame '{self.base_frame}'"
                     )
                     break
+                assert self.target_to_input_transform is not None, (
+                    "Transform should not be None here"
+                )
 
                 # Step 2: Recalculate pose based on anchor frame
                 recalculated_pose = self.recalculate_target(
@@ -348,10 +381,13 @@ class ConvertToControlsPose(Node):
                 )
 
                 # Step 3: Transform to controls frame
-                # final_pose = self.transform_to_frame(
-                #     recalculated_pose, self.controls_frame, timeout
-                # )
-                odom_transform = self.get_base_to_world_tf_stamped()
+                odom_transform = get_base_to_world_tf_stamped(
+                    self.get_odom_at_time(
+                        header_time_to_seconds(
+                            self.target_to_input_transform.header.stamp
+                        )
+                    )
+                )
 
                 # Apply odom transform to get final pose in odom parent frame
                 final_pose = do_transform_pose_stamped(
@@ -373,53 +409,7 @@ class ConvertToControlsPose(Node):
 
             self.get_logger().debug(f"Exception traceback: {traceback.format_exc()}")
 
-            response.output_poses = input_poses
-            response.tf_success = False
-
         return response
-
-    def get_base_to_world_tf_stamped(self):
-        odom_transform = tf2_ros.TransformStamped()
-        odom_transform.header = self.odom.header
-        odom_transform.transform.translation.x = self.odom.pose.pose.position.x
-        odom_transform.transform.translation.y = self.odom.pose.pose.position.y
-        odom_transform.transform.translation.z = self.odom.pose.pose.position.z
-        odom_transform.transform.rotation = self.odom.pose.pose.orientation
-        return odom_transform
-
-    def get_world_to_base_tf_stamped(self):
-        odom_transform = self.get_base_to_world_tf_stamped()
-        translation = (
-            odom_transform.transform.translation.x,
-            odom_transform.transform.translation.y,
-            odom_transform.transform.translation.z,
-        )
-        rotation = (
-            odom_transform.transform.rotation.x,
-            odom_transform.transform.rotation.y,
-            odom_transform.transform.rotation.z,
-            odom_transform.transform.rotation.w,
-        )
-
-        T = concatenate_matrices(
-            translation_matrix(translation),
-            quaternion_matrix(rotation),
-        )
-        T_inv = inverse_matrix(T)
-        translation_inv = translation_from_matrix(T_inv)
-        rotation_inv = quaternion_from_matrix(T_inv)
-        world_to_base_tf = tf2_ros.TransformStamped()
-        world_to_base_tf.header = self.odom.header
-        world_to_base_tf.header.frame_id = self.base_frame
-
-        world_to_base_tf.transform.translation.x = translation_inv[0]
-        world_to_base_tf.transform.translation.y = translation_inv[1]
-        world_to_base_tf.transform.translation.z = translation_inv[2]
-        world_to_base_tf.transform.rotation.x = rotation_inv[0]
-        world_to_base_tf.transform.rotation.y = rotation_inv[1]
-        world_to_base_tf.transform.rotation.z = rotation_inv[2]
-        world_to_base_tf.transform.rotation.w = rotation_inv[3]
-        return world_to_base_tf
 
 
 def main(args: Optional[Any] = None) -> None:

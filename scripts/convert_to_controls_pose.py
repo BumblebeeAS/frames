@@ -23,7 +23,6 @@ from rclpy.qos import (
     ReliabilityPolicy,
     qos_profile_sensor_data,
 )
-from rclpy.time import Time as RclpyTime
 from tf2_geometry_msgs import do_transform_pose_stamped
 from tf2_msgs.msg import TFMessage
 from tf2_ros.buffer import Buffer
@@ -97,6 +96,8 @@ class ConvertToControlsPose(Node):
             self.convert_callback,
         )
 
+        self.target_to_input_transform: Optional[tf2_ros.TransformStamped] = None
+
         self.get_logger().info("ConvertToControlsPose service started")
         self.get_logger().info(f"Using controls frame: '{self.controls_frame}'")
         self.get_logger().info(f"Using base frame: '{self.base_frame}'")
@@ -144,6 +145,7 @@ class ConvertToControlsPose(Node):
 
         self.get_logger().info(f"time diff (before): {before_time_diff}")
         self.get_logger().info(f"time diff (after): {after_time_diff}")
+        self.get_logger().info(f"selected idx: {idx}/{self.queue_size}")
 
         if before_time_diff <= after_time_diff:
             return before
@@ -162,7 +164,7 @@ class ConvertToControlsPose(Node):
             target_to_input_transform = self.tf_buffer.lookup_transform(
                 target_frame=target_frame[0],
                 source_frame=input_pose.header.frame_id,
-                time=RclpyTime(seconds=0),
+                time=self.get_clock().now(),
                 timeout=Duration(seconds=timeout),  # type: ignore
             )
             is_from_base_link = True
@@ -179,7 +181,7 @@ class ConvertToControlsPose(Node):
                 target_to_input_transform = self.tf_buffer.lookup_transform(
                     target_frame=target_frame[1],
                     source_frame=input_pose.header.frame_id,
-                    time=RclpyTime(seconds=0),
+                    time=self.get_clock().now(),
                     timeout=Duration(seconds=timeout),  # type: ignore
                 )
                 odom = self.get_odom_at_time(
@@ -222,14 +224,14 @@ class ConvertToControlsPose(Node):
         Raises:
             Exception: If the transform fails
         """
+        self.target_to_input_transform = self.get_transform(
+            target_frame, input_pose, timeout
+        )
         if input_pose.header.frame_id == target_frame[0]:
             return input_pose
 
         self.get_logger().debug(
             f"Transforming pose from '{input_pose.header.frame_id}' to '{target_frame[0]}'"
-        )
-        self.target_to_input_transform = self.get_transform(
-            target_frame, input_pose, timeout
         )
 
         if self.target_to_input_transform is None:
@@ -371,6 +373,7 @@ class ConvertToControlsPose(Node):
                         f"Failed to transform pose {i + 1} to base frame '{self.base_frame}'"
                     )
                     break
+
                 assert self.target_to_input_transform is not None, (
                     "Transform should not be None here"
                 )
@@ -407,7 +410,7 @@ class ConvertToControlsPose(Node):
             self.get_logger().error(f"Failed to convert poses: {str(e)}")
             import traceback
 
-            self.get_logger().debug(f"Exception traceback: {traceback.format_exc()}")
+            self.get_logger().error(f"Exception traceback: {traceback.format_exc()}")
 
         return response
 

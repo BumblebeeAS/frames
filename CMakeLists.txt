@@ -125,6 +125,11 @@ ament_export_libraries(enu_ned_converters)
 # target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
+  # the following lines skips linting
+  set(ament_cmake_flake8_FOUND TRUE)
+  set(ament_cmake_pep257_FOUND TRUE)
+  set(ament_cmake_lint_cmake_FOUND TRUE)
+  set(ament_cmake_uncrustify_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
 

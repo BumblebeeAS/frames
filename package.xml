@@ -8,11 +8,13 @@
     <license>MIT</license>
 
     <buildtool_depend>ament_cmake</buildtool_depend>
+    <buildtool_depend>ament_cmake_auto</buildtool_depend>
     <buildtool_depend>ament_cmake_python</buildtool_depend>
 
     <depend>rclcpp</depend>
     <depend>rclcpp_components</depend>
     <depend>rclpy</depend>
+
     <depend>geometry_msgs</depend>
     <depend>nav_msgs</depend>
     <depend>sensor_msgs</depend>
@@ -22,11 +24,28 @@
     <depend version_gte="0.0.2">bb_planner_msgs</depend>
     <depend>example_interfaces</depend>
 
+    <depend>eigen</depend>
+
+    <exec_depend>builtin_interfaces</exec_depend>
+    <exec_depend>tf2_msgs</exec_depend>
+
+    <exec_depend>launch</exec_depend>
+    <exec_depend>launch_ros</exec_depend>
     <exec_depend>ros2launch</exec_depend>
+
+    <exec_depend>tf_transformations</exec_depend>
+    <exec_depend>python3-numpy</exec_depend>
+    <exec_depend>python3-yaml</exec_depend>
+    <!-- Use the pip-installed version instead of the system version -->
+    <!-- Ubuntu 22.04 uses python3-transforms3d version 0.3.1 -->
+    <!-- This has a `numpy.float` bug which is incompatible with numpy 1.24+ -->
+    <!-- This is fixed in Ubuntu 24.04 which uses python3-transforms3d version 0.4.1 -->
     <exec_depend>python-transforms3d-pip</exec_depend>
 
     <test_depend>ament_lint_auto</test_depend>
     <test_depend>ament_lint_common</test_depend>
+    <test_depend>ament_cmake_pytest</test_depend>
+    <test_depend>python3-pytest</test_depend>
 
     <export>
         <build_type>ament_cmake</build_type>

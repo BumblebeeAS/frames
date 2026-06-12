@@ -36,7 +36,7 @@ def generate_launch_description():
                 "controls_frame": LaunchConfiguration("controls_frame"),
                 "base_frame": LaunchConfiguration("base_frame"),
                 "queue_size": 100,
-                "odom_topic": "/auv5/nav/ukf/odom_ned",
+                "odom_topic": "/auv5/nav/odom_ned",
             }
         ],
         output="screen",

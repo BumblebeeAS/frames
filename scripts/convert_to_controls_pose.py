@@ -424,8 +424,13 @@ def main(args: Optional[Any] = None) -> None:
     """
     rclpy.init(args=args)
     node = ConvertToControlsPose()
-    rclpy.spin(node)
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

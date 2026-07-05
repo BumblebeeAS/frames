@@ -12,7 +12,7 @@ from frames.utils.transform_ros_msgs import (
     get_base_to_world_tf_stamped,
     get_world_to_base_tf_stamped,
 )
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Quaternion
 from nav_msgs.msg import Odometry
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -26,6 +26,7 @@ from rclpy.qos import (
 from tf2_geometry_msgs import do_transform_pose_stamped
 from tf2_msgs.msg import TFMessage
 from tf2_ros.buffer import Buffer
+from tf_transformations import quaternion_multiply
 
 
 def header_time_to_seconds(header_time: Time) -> float:
@@ -77,6 +78,7 @@ class ConvertToControlsPose(Node):
             depth=10,
         )
         self.tf_buffer: Buffer = Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.odom_buffer: deque[Odometry] = deque(maxlen=self.queue_size)
         self.tf_sub = self.create_subscription(
             TFMessage,
@@ -151,21 +153,33 @@ class ConvertToControlsPose(Node):
             return before
         return after
 
+    def lookup_with_fallback(self, target_frame: str, source_frame: str, timeout: float) -> tf2_ros.TransformStamped:
+        try:
+            return self.tf_buffer.lookup_transform(
+                target_frame=target_frame,
+                source_frame=source_frame,
+                time=self.get_clock().now(),
+                timeout=Duration(seconds=timeout),  # type: ignore
+            )
+        except Exception:
+            return self.tf_buffer.lookup_transform(
+                target_frame=target_frame,
+                source_frame=source_frame,
+                time=rclpy.time.Time(),
+                timeout=Duration(seconds=timeout),  # type: ignore
+            )
+
     def get_transform(
         self, target_frame: list[str], input_pose: PoseStamped, timeout: float
-    ) -> Optional[tf2_ros.TransformStamped]:
-        """
-        Get the transform from the input pose frame to the target frame.
-        """
+    ) -> tf2_ros.TransformStamped:
         is_from_base_link = False
         target_to_input_transform = None
 
         try:
-            target_to_input_transform = self.tf_buffer.lookup_transform(
+            target_to_input_transform = self.lookup_with_fallback(
                 target_frame=target_frame[0],
                 source_frame=input_pose.header.frame_id,
-                time=self.get_clock().now(),
-                timeout=Duration(seconds=timeout),  # type: ignore
+                timeout=timeout,
             )
             is_from_base_link = True
         except (
@@ -175,14 +189,17 @@ class ConvertToControlsPose(Node):
         ) as e:
             self.get_logger().error(f"Transform lookup failed: {e}")
 
+        if is_from_base_link:
+            # target_to_input_transform is from base link to input frame
+            pass
+
         if not is_from_base_link:
             # tf is from world to input frame
             try:
-                target_to_input_transform = self.tf_buffer.lookup_transform(
+                target_to_input_transform = self.lookup_with_fallback(
                     target_frame=target_frame[1],
                     source_frame=input_pose.header.frame_id,
-                    time=self.get_clock().now(),
-                    timeout=Duration(seconds=timeout),  # type: ignore
+                    timeout=timeout,
                 )
                 odom = self.get_odom_at_time(
                     header_time_to_seconds(target_to_input_transform.header.stamp)
@@ -278,10 +295,10 @@ class ConvertToControlsPose(Node):
             f"Getting translation from '{anchor_frame}' to '{self.base_frame}'"
         )
 
-        transform = self.tf_buffer.lookup_transform(
+        transform = self.lookup_with_fallback(
             self.base_frame,
             anchor_frame,
-            Duration(seconds=timeout),  # type: ignore
+            timeout=timeout,
         )
 
         # Create output pose and copy original pose data
@@ -374,32 +391,50 @@ class ConvertToControlsPose(Node):
                     )
                     break
 
-                assert self.target_to_input_transform is not None, (
-                    "Transform should not be None here"
-                )
+                assert (
+                    self.target_to_input_transform is not None
+                ), "Transform should not be None here"
 
                 # Step 2: Recalculate pose based on anchor frame
                 recalculated_pose = self.recalculate_target(
                     pose_in_base_frame, anchor_frame, timeout
                 )
 
-                # Step 3: Transform to controls frame
-                odom_transform = get_base_to_world_tf_stamped(
-                    self.get_odom_at_time(
-                        header_time_to_seconds(
-                            self.target_to_input_transform.header.stamp
-                        )
-                    )
+                # Get Odometry to find the expected child frame (e.g. asv5/base_link_ned)
+                odom_msg = self.get_odom_at_time(
+                    header_time_to_seconds(recalculated_pose.header.stamp)
                 )
+
+                # Ensure recalculated_pose is in the odom child frame before applying odom_transform
+                # This inherently handles ENU -> NED conversion if base_frame != odom.child_frame_id
+                odom_child_frame = odom_msg.child_frame_id
+                if recalculated_pose.header.frame_id != odom_child_frame:
+                    try:
+                        base_to_odom_child_tf = self.lookup_with_fallback(
+                            odom_child_frame,
+                            recalculated_pose.header.frame_id,
+                            timeout=timeout
+                        )
+                        recalculated_pose_for_odom = do_transform_pose_stamped(
+                            recalculated_pose, base_to_odom_child_tf
+                        )
+                    except Exception as e:
+                        self.get_logger().error(f"Failed to transform to {odom_child_frame}: {e}")
+                        recalculated_pose_for_odom = recalculated_pose
+                else:
+                    recalculated_pose_for_odom = recalculated_pose
+
+                # Step 3: Transform to controls frame
+                odom_transform = get_base_to_world_tf_stamped(odom_msg)
 
                 # Apply odom transform to get final pose in odom parent frame
                 final_pose = do_transform_pose_stamped(
-                    recalculated_pose, odom_transform
+                    recalculated_pose_for_odom, odom_transform
                 )
 
-                assert final_pose is not None, (
-                    f"Final transform to '{self.controls_frame}' failed"
-                )
+                assert (
+                    final_pose is not None
+                ), f"Final transform to '{self.controls_frame}' failed"
                 output_poses.append(final_pose)
 
             response.output_poses = output_poses

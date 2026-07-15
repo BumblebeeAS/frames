@@ -127,6 +127,11 @@ class ConvertToControlsPose(Node):
         Returns:
             The closest odometry message
         """
+        if time <= 0.0:
+            # Zero stamp means "latest" (tf2 convention), not epoch 1970
+            self.get_logger().info("Zero-stamped query, returning latest odom")
+            return self.odom_buffer[-1]
+
         idx = min(
             bisect_left(
                 self.odom_buffer,

@@ -18,13 +18,6 @@ def generate_launch_description():
             description="Namespace of the vehicle",
         )
     )
-    dest_pose_from_tf_node = Node(
-        package="frames",
-        namespace=LaunchConfiguration("namespace"),
-        executable="dest_pose_from_tf",
-        name="convert_frame",
-    )
-    ld.add_action(dest_pose_from_tf_node)
 
     convert_to_controls_pose = Node(
         package="frames",
@@ -36,7 +29,7 @@ def generate_launch_description():
                 "controls_frame": LaunchConfiguration("controls_frame"),
                 "base_frame": LaunchConfiguration("base_frame"),
                 "queue_size": 100,
-                "odom_topic": "/auv4/nav/ukf/odom_ned",
+                "odom_topic": "/auv4/nav/odom_ned",
             }
         ],
         output="screen",

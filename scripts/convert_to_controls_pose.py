@@ -65,7 +65,7 @@ class ConvertToControlsPose(Node):
             .integer_value
         )
         self.odom_topic: str = (
-            self.declare_parameter("odom_topic", "/uav2/odom_ned")
+            self.declare_parameter("odom_topic", "/uav/odom_ned")
             .get_parameter_value()
             .string_value
         )

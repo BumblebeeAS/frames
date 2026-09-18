@@ -360,13 +360,17 @@ class ConvertToControlsPose(Node):
         timeout = request.timeout
 
         response.tf_success = False
-        response.output_poses = input_poses
+        response.output_poses = []
 
         output_poses = []
 
         self.get_logger().info(
             f"Received transform request for {len(input_poses)} poses to '{self.controls_frame}'"
         )
+
+        if not input_poses:
+            self.get_logger().error("Pose conversion requires at least one input pose")
+            return response
 
         if timeout <= 0.0:
             timeout = 1.0
@@ -394,7 +398,7 @@ class ConvertToControlsPose(Node):
                     self.get_logger().error(
                         f"Failed to transform pose {i + 1} to base frame '{self.base_frame}'"
                     )
-                    break
+                    return response
 
                 assert (
                     self.target_to_input_transform is not None
@@ -425,7 +429,7 @@ class ConvertToControlsPose(Node):
                         )
                     except Exception as e:
                         self.get_logger().error(f"Failed to transform to {odom_child_frame}: {e}")
-                        recalculated_pose_for_odom = recalculated_pose
+                        return response
                 else:
                     recalculated_pose_for_odom = recalculated_pose
 

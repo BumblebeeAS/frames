@@ -3,7 +3,7 @@ from launch_ros.actions import Node, PushRosNamespace
 
 
 def generate_launch_description():
-    launch_objects = [PushRosNamespace("/uav")]
+    launch_objects = [PushRosNamespace("uav")]
 
     nodes = [
         Node(
@@ -12,10 +12,10 @@ def generate_launch_description():
             name="convert_to_controls_pose",
             parameters=[
                 {
-                    "controls_frame": "odom_ned",
+                    "controls_frame": "home_ned",
                     "base_frame": "uav/base_link_frd",
                     "queue_size": 100,
-                    "odom_topic": "/uav/odom_ned",
+                    "odom_topic": "/uav/odom_home_ned",
                 }
             ],
             output="screen",

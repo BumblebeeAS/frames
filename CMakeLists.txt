@@ -30,6 +30,9 @@ find_package(example_interfaces REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(bb_controls_msgs REQUIRED)
+find_package(nav2_msgs REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -88,9 +91,27 @@ ament_target_dependencies(dest_pose_from_tf
 )
 ament_export_include_directories(include)
 
+add_executable(path_tracker
+  src/nodes/entrypoints/PathTracker.cpp
+  src/nodes/PathTrackerROS2Wrapper.cpp
+)
+ament_target_dependencies(path_tracker
+  rclcpp
+  rclcpp_action
+  geometry_msgs
+  nav_msgs
+  nav2_msgs
+  bb_controls_msgs
+  bb_planner_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+)
+
 
 install(TARGETS
   dest_pose_from_tf
+  path_tracker
   enu_ned_converters
   EXPORT export_enu_ned_converters
   ARCHIVE DESTINATION lib
@@ -112,6 +133,7 @@ install(PROGRAMS
 
 # Install launch files
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME}/)
+install(DIRECTORY cfg DESTINATION share/${PROJECT_NAME}/)
 
 ament_export_libraries(enu_ned_converters)
 

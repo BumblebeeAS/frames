@@ -1,0 +1,16 @@
+path_tracker_node:
+  ros__parameters:
+    use_sim_time: true
+    tracking_loop_rate: 5.0
+    path_validity_check_rate: 1.0
+    simplification_epsilon: 0.05
+    lookahead_waypoints: 3
+    pruning_distance_threshold: 1.0
+
+    nav2_action_name: "/asv5/compute_path_to_pose"
+    nav2_is_path_valid_service: "/asv5/is_path_valid"
+    locomotion_action_name: "/asv5/controls"
+    pose_conversion_service_name: "/asv5/convert_to_controls_pose"
+
+    global_frame_id: "asv5/map"
+    base_link_frame_id: "asv5/base_link"

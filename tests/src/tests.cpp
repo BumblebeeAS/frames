@@ -4,7 +4,7 @@
 #include "frames/frames.h"
 
 #include "geometry_msgs/Quaternion.h"
-#include "tf2/LinearMath/Quaternion.h"
+#include "tf2/LinearMath/Quaternion.hpp"
 
 namespace tests
 {

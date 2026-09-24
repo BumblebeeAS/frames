@@ -19,7 +19,6 @@ endif()
 
 include_directories(
   include
-  ${EIGEN3_INCLUDE_DIR}
 )
 
 find_package(ament_cmake REQUIRED)
@@ -53,7 +52,8 @@ ament_target_dependencies(enu_ned_converters
   rclcpp rclcpp_components
   tf2 tf2_ros geometry_msgs
   nav_msgs sensor_msgs
-  example_interfaces Eigen3)
+  example_interfaces)
+target_link_libraries(enu_ned_converters Eigen3::Eigen)
 
 # rclcpp_components_register_node(enu_ned_converters PLUGIN "PoseWithCovarianceEnuNed" EXECUTABLE pose_with_covariance_enu_ned_node)
 rclcpp_components_register_node(enu_ned_converters PLUGIN "PoseWithCovarianceStampedEnuNed" EXECUTABLE pose_with_covariance_stamped_enu_ned_node)
@@ -89,6 +89,7 @@ ament_target_dependencies(dest_pose_from_tf
   tf2
   tf2_geometry_msgs
 )
+target_link_libraries(dest_pose_from_tf PUBLIC Eigen3::Eigen)
 ament_export_include_directories(include)
 
 add_executable(path_tracker

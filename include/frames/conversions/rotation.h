@@ -10,7 +10,7 @@
 
 #include <geometry_msgs/msg/quaternion.h>
 #include <geometry_msgs/msg/quaternion_stamped.h>
-#include "tf2/LinearMath/Quaternion.h"
+#include "tf2/LinearMath/Quaternion.hpp"
 
 namespace frame_utils::geometry
 {

@@ -1,8 +1,8 @@
 #pragma once
 
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_listener.h>
-#include <tf2/utils.h>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_ros/transform_listener.hpp>
+#include <tf2/utils.hpp>
 
 #include <bb_controls_msgs/action/locomotion.hpp>
 #include <bb_controls_msgs/action/track_path.hpp>

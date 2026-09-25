@@ -5,7 +5,7 @@ int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<PathTrackerROS2Wrapper>("path_tracker_node");
     
-    // Use MultiThreadedExecutor since we have multiple action clients/servers
+    // Lets client responses resolve while tick() runs
     rclcpp::executors::MultiThreadedExecutor executor;
     executor.add_node(node);
     

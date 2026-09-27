@@ -38,7 +38,7 @@ def generate_launch_description():
                 "controls_frame": LaunchConfiguration("controls_frame"),
                 "base_frame": LaunchConfiguration("base_frame"),
                 "queue_size": 100,
-                "odom_topic": "/asv5/odometry/filtered/local/ned",
+                "odom_topic": "/asv5/odometry/filtered/local_ned",
                 "use_sim_time": LaunchConfiguration("use_sim_time"),
             }
         ],

@@ -44,6 +44,11 @@ private:
     rclcpp_action::Client<Locomotion>::SharedPtr locomotion_action_client_;
     rclcpp::Client<IsPathValid>::SharedPtr is_path_valid_client_;
     rclcpp::Client<GetPose>::SharedPtr pose_conversion_client_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr simplified_path_pub_;  // null when disabled
+
+    // GUI click goals, forwarded to our own action server
+    rclcpp::Subscription<PoseStamped>::SharedPtr click_goal_sub_;
+    rclcpp_action::Client<TrackPath>::SharedPtr click_goal_client_;
 
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
@@ -64,6 +69,7 @@ private:
     double send_timeout_;
     double stop_timeout_;
     int tf_failure_limit_;
+    bool click_goal_2d_;
     std::string global_frame_id_;
     std::string base_link_frame_id_;
 
@@ -131,6 +137,7 @@ private:
                                             std::shared_ptr<const TrackPath::Goal> goal);
     rclcpp_action::CancelResponse handle_cancel(const std::shared_ptr<GoalHandleTrackPath> goal_handle);
     void handle_accepted(const std::shared_ptr<GoalHandleTrackPath> goal_handle);
+    void on_click_goal(const PoseStamped::SharedPtr msg);
 
     // Tick
     void tick();

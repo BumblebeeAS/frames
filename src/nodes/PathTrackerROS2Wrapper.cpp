@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <tf2/LinearMath/Quaternion.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 using namespace std::placeholders;
@@ -30,6 +31,14 @@ PathTrackerROS2Wrapper::PathTrackerROS2Wrapper(const std::string& name) : Node(n
     send_timeout_               = this->declare_parameter("send_timeout", 2.0);
     stop_timeout_               = this->declare_parameter("stop_timeout", 3.0);
     tf_failure_limit_           = this->declare_parameter("tf_failure_limit", 10);
+
+    const bool click_goal_enable       = this->declare_parameter("click_goal_enable", false);
+    const std::string click_goal_topic = this->declare_parameter("click_goal_topic", "click_goal");
+    click_goal_2d_                     = this->declare_parameter("click_goal_2d", true);
+
+    const bool simplified_path_viz_enable = this->declare_parameter("simplified_path_viz_enable", false);
+    const std::string simplified_path_viz_topic
+        = this->declare_parameter("simplified_path_viz_topic", "simplified_path");
 
     std::string nav2_action_name           = this->declare_parameter("nav2_action_name", "compute_path_to_pose");
     std::string nav2_is_path_valid_service = this->declare_parameter("nav2_is_path_valid_service", "is_path_valid");
@@ -64,6 +73,23 @@ PathTrackerROS2Wrapper::PathTrackerROS2Wrapper(const std::string& name) : Node(n
     pose_conversion_client_
         = this->create_client<GetPose>(pose_conversion_service_name, rclcpp::ServicesQoS(), client_cb_group_);
 
+    // Latched so a viewer that connects later still gets the current plan
+    if (simplified_path_viz_enable) {
+        simplified_path_pub_ = this->create_publisher<nav_msgs::msg::Path>(simplified_path_viz_topic,
+                                                                           rclcpp::QoS(1).transient_local());
+    }
+
+    // Clicks go through the action server so they behave exactly like an action call, preemption included
+    if (click_goal_enable) {
+        click_goal_client_ = rclcpp_action::create_client<TrackPath>(this, "in/locomotion/track_path", client_cb_group_);
+        rclcpp::SubscriptionOptions click_options;
+        click_options.callback_group = client_cb_group_;
+        click_goal_sub_              = this->create_subscription<PoseStamped>(
+            click_goal_topic, 1, std::bind(&PathTrackerROS2Wrapper::on_click_goal, this, _1), click_options);
+        RCLCPP_INFO(this->get_logger(), "Accepting click goals on %s (%s)", click_goal_sub_->get_topic_name(),
+                    click_goal_2d_ ? "2D" : "3D");
+    }
+
     tick_timer_ = this->create_wall_timer(std::chrono::duration<double>(1.0 / tick_rate_),
                                           std::bind(&PathTrackerROS2Wrapper::tick, this), server_cb_group_);
 }
@@ -94,6 +120,31 @@ void PathTrackerROS2Wrapper::handle_accepted(const std::shared_ptr<GoalHandleTra
         pending_->abort(result);
     }
     pending_ = goal_handle;
+}
+
+void PathTrackerROS2Wrapper::on_click_goal(const PoseStamped::SharedPtr msg) {
+    if (!click_goal_client_->action_server_is_ready()) {
+        RCLCPP_WARN(this->get_logger(), "Click goal dropped, TrackPath server not ready");
+        return;
+    }
+
+    TrackPath::Goal goal;
+    goal.goal_pose              = *msg;
+    goal.goal_pose.header.stamp = builtin_interfaces::msg::Time();  // latest TF, so replans never look up a stale stamp
+    if (click_goal_2d_) {
+        tf2::Quaternion q;
+        q.setRPY(0.0, 0.0, tf2::getYaw(msg->pose.orientation));
+        goal.goal_pose.pose.orientation = tf2::toMsg(q);
+        goal.goal_pose.pose.position.z  = 0.0;
+        goal.ignore_depth               = true;
+    } else {
+        goal.ignore_depth = false;
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Click goal: (%.2f, %.2f, %.2f) yaw %.1f deg in %s", goal.goal_pose.pose.position.x,
+                goal.goal_pose.pose.position.y, goal.goal_pose.pose.position.z,
+                tf2::getYaw(goal.goal_pose.pose.orientation) * 180.0 / M_PI, msg->header.frame_id.c_str());
+    click_goal_client_->async_send_goal(goal);
 }
 
 void PathTrackerROS2Wrapper::tick() {
@@ -404,6 +455,14 @@ void PathTrackerROS2Wrapper::install_path(const std::vector<PoseStamped>& poses)
     clear_validity();
     next_validity_time_ = now_s() + validity_period_;
     state_              = State::TRACKING;
+
+    if (simplified_path_pub_) {
+        nav_msgs::msg::Path path;
+        path.header.frame_id = global_frame_id_;
+        path.header.stamp    = this->get_clock()->now();
+        for (const size_t idx : waypoints_) path.poses.push_back(dense_[idx]);
+        simplified_path_pub_->publish(path);
+    }
 
     RCLCPP_INFO(this->get_logger(), "Plan received. Dense size: %zu, Simplified size: %zu", dense_.size(),
                 waypoints_.size());

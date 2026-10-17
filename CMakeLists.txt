@@ -25,7 +25,7 @@ find_package(ament_cmake REQUIRED)
 find_package(ament_cmake_python REQUIRED)
 find_package(ament_cmake_auto REQUIRED)
 find_package(bb_planner_msgs REQUIRED)
-find_package(example_interfaces REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
@@ -51,8 +51,7 @@ add_library(enu_ned_converters SHARED
 ament_target_dependencies(enu_ned_converters
   rclcpp rclcpp_components
   tf2 tf2_ros geometry_msgs
-  nav_msgs sensor_msgs
-  example_interfaces)
+  nav_msgs sensor_msgs)
 target_link_libraries(enu_ned_converters Eigen3::Eigen)
 
 # rclcpp_components_register_node(enu_ned_converters PLUGIN "PoseWithCovarianceEnuNed" EXECUTABLE pose_with_covariance_enu_ned_node)
@@ -79,7 +78,7 @@ src/dest_pose_from_tf.cpp)
 ament_target_dependencies(dest_pose_from_tf
   PUBLIC
   bb_planner_msgs
-  example_interfaces
+  std_srvs
   rclcpp
   rclcpp_components
   nav_msgs

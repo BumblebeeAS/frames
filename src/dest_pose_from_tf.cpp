@@ -1,7 +1,7 @@
 #include <string>
 #include "bb_planner_msgs/srv/get_pose_to_dest_frame.hpp"
 #include "enu_ned_converter_helper.hpp"
-#include "example_interfaces/srv/trigger.hpp"
+#include "std_srvs/srv/trigger.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "rclcpp/duration.hpp"
@@ -31,7 +31,7 @@ public:
 		srv_ = this->create_service<bb_planner_msgs::srv::GetPoseToDestFrame>(
 			"get_dest_pose", std::bind(&DestPoseFromTf::srvCallBack, this, _1, _2)
 		);
-		clear_buffer_srv_ = this->create_service<example_interfaces::srv::Trigger>(
+		clear_buffer_srv_ = this->create_service<std_srvs::srv::Trigger>(
 			"clear_buffer", std::bind(&DestPoseFromTf::clearBuffer, this, _1, _2)
 		);
 
@@ -40,7 +40,7 @@ public:
 
 private:
 	rclcpp::Service<bb_planner_msgs::srv::GetPoseToDestFrame>::SharedPtr srv_;
-	rclcpp::Service<example_interfaces::srv::Trigger>::SharedPtr clear_buffer_srv_;
+	rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr clear_buffer_srv_;
 	std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
 	std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 	int tf_cache_time_;
@@ -51,8 +51,8 @@ private:
 	);
 
 	void clearBuffer(
-		const std::shared_ptr<example_interfaces::srv::Trigger::Request>,
-		const std::shared_ptr<example_interfaces::srv::Trigger::Response> response
+		const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+		const std::shared_ptr<std_srvs::srv::Trigger::Response> response
 	)
 	{
 		tf_buffer_->clear();

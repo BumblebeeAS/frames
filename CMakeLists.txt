@@ -48,11 +48,17 @@ set_target_properties(${PROJECT_NAME}  PROPERTIES LINKER_LANGUAGE CXX)
 add_library(enu_ned_converters SHARED
   src/enu_ned_converter.cpp)
 
-ament_target_dependencies(enu_ned_converters
-  rclcpp rclcpp_components
-  tf2 tf2_ros geometry_msgs
-  nav_msgs sensor_msgs)
-target_link_libraries(enu_ned_converters Eigen3::Eigen)
+target_link_libraries(enu_ned_converters PUBLIC
+  rclcpp::rclcpp
+  rclcpp_components::component
+  ${geometry_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  Eigen3::Eigen
+  PRIVATE
+  tf2::tf2
+  tf2_ros::tf2_ros
+)
 
 # rclcpp_components_register_node(enu_ned_converters PLUGIN "PoseWithCovarianceEnuNed" EXECUTABLE pose_with_covariance_enu_ned_node)
 rclcpp_components_register_node(enu_ned_converters PLUGIN "PoseWithCovarianceStampedEnuNed" EXECUTABLE pose_with_covariance_stamped_enu_ned_node)
@@ -75,37 +81,36 @@ rclcpp_components_register_node(enu_ned_converters PLUGIN "OdometryEnuNed" EXECU
 
 add_executable(dest_pose_from_tf
 src/dest_pose_from_tf.cpp)
-ament_target_dependencies(dest_pose_from_tf
-  PUBLIC
-  bb_planner_msgs
-  std_srvs
-  rclcpp
-  rclcpp_components
-  nav_msgs
-  sensor_msgs
-  geometry_msgs
-  tf2_ros
-  tf2
-  tf2_geometry_msgs
+target_link_libraries(dest_pose_from_tf PRIVATE
+  ${bb_planner_msgs_TARGETS}
+  ${std_srvs_TARGETS}
+  rclcpp::rclcpp
+  rclcpp_components::component
+  ${nav_msgs_TARGETS}
+  ${sensor_msgs_TARGETS}
+  ${geometry_msgs_TARGETS}
+  tf2_ros::tf2_ros
+  tf2::tf2
+  tf2_geometry_msgs::tf2_geometry_msgs
+  Eigen3::Eigen
 )
-target_link_libraries(dest_pose_from_tf PUBLIC Eigen3::Eigen)
 ament_export_include_directories(include)
 
 add_executable(path_tracker
   src/nodes/entrypoints/PathTracker.cpp
   src/nodes/PathTrackerROS2Wrapper.cpp
 )
-ament_target_dependencies(path_tracker
-  rclcpp
-  rclcpp_action
-  geometry_msgs
-  nav_msgs
-  nav2_msgs
-  bb_controls_msgs
-  bb_planner_msgs
-  tf2
-  tf2_ros
-  tf2_geometry_msgs
+target_link_libraries(path_tracker PRIVATE
+  rclcpp::rclcpp
+  rclcpp_action::rclcpp_action
+  ${geometry_msgs_TARGETS}
+  ${nav_msgs_TARGETS}
+  ${nav2_msgs_TARGETS}
+  ${bb_controls_msgs_TARGETS}
+  ${bb_planner_msgs_TARGETS}
+  tf2::tf2
+  tf2_ros::tf2_ros
+  tf2_geometry_msgs::tf2_geometry_msgs
 )
 
 

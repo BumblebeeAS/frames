@@ -79,44 +79,23 @@ rclcpp_components_register_node(enu_ned_converters PLUGIN "ImuEnuNed" EXECUTABLE
 rclcpp_components_register_node(enu_ned_converters PLUGIN "OdometryEnuNed" EXECUTABLE odometry_enu_ned_node)
 
 
-add_executable(dest_pose_from_tf
+ament_auto_add_executable(dest_pose_from_tf NO_TARGET_LINK_LIBRARIES
 src/dest_pose_from_tf.cpp)
-target_link_libraries(dest_pose_from_tf PRIVATE
-  ${bb_planner_msgs_TARGETS}
-  ${std_srvs_TARGETS}
-  rclcpp::rclcpp
-  rclcpp_components::component
-  ${nav_msgs_TARGETS}
-  ${sensor_msgs_TARGETS}
-  ${geometry_msgs_TARGETS}
-  tf2_ros::tf2_ros
-  tf2::tf2
-  tf2_geometry_msgs::tf2_geometry_msgs
-  Eigen3::Eigen
-)
+target_link_libraries(dest_pose_from_tf Eigen3::Eigen)
 ament_export_include_directories(include)
 
-add_executable(path_tracker
+ament_auto_add_executable(path_tracker NO_TARGET_LINK_LIBRARIES
   src/nodes/entrypoints/PathTracker.cpp
   src/nodes/PathTrackerROS2Wrapper.cpp
 )
-target_link_libraries(path_tracker PRIVATE
-  rclcpp::rclcpp
-  rclcpp_action::rclcpp_action
-  ${geometry_msgs_TARGETS}
-  ${nav_msgs_TARGETS}
-  ${nav2_msgs_TARGETS}
-  ${bb_controls_msgs_TARGETS}
-  ${bb_planner_msgs_TARGETS}
-  tf2::tf2
-  tf2_ros::tf2_ros
-  tf2_geometry_msgs::tf2_geometry_msgs
-)
+target_link_libraries(path_tracker Eigen3::Eigen)
 
+
+# Executables do not expose link dependencies to other targets.
+set_property(TARGET dest_pose_from_tf path_tracker
+  PROPERTY INTERFACE_LINK_LIBRARIES "")
 
 install(TARGETS
-  dest_pose_from_tf
-  path_tracker
   enu_ned_converters
   EXPORT export_enu_ned_converters
   ARCHIVE DESTINATION lib

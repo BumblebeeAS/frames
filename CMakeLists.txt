@@ -109,10 +109,28 @@ ament_target_dependencies(path_tracker
   tf2_geometry_msgs
 )
 
+add_executable(path_tracker_replan
+  src/nodes/entrypoints/ReplanTracker.cpp
+  src/nodes/ReplanTrackerROS2Wrapper.cpp
+)
+ament_target_dependencies(path_tracker_replan
+  rclcpp
+  rclcpp_action
+  geometry_msgs
+  nav_msgs
+  nav2_msgs
+  bb_controls_msgs
+  bb_planner_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+)
+
 
 install(TARGETS
   dest_pose_from_tf
   path_tracker
+  path_tracker_replan
   enu_ned_converters
   EXPORT export_enu_ned_converters
   ARCHIVE DESTINATION lib

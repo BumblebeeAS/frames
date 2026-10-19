@@ -1,0 +1,35 @@
+replan_tracker_node:
+  ros__parameters:
+    use_sim_time: false
+    tracking_loop_rate: 10.0
+    check_rate: 1.0
+    simplification_epsilon: 0.2
+    pruning_distance_threshold: 0.5
+    search_distance: 3.0
+    stop_distance: 5.0
+    resend_threshold: 0.3  # map to odom shift of the route ahead that triggers a resend
+    resend_tracking_error: 1.0
+    progress_radius: 0.5
+    progress_timeout: 30.0
+    plan_timeout: 5.0
+    conversion_timeout: 10.0
+    send_timeout: 2.0
+    stop_timeout: 3.0
+    tf_failure_limit: 10
+
+    click_goal_enable: true
+    click_goal_topic: "/asv5/track_path/click_goal"
+    click_goal_2d: true
+    click_goal_specified_heading: false
+
+    simplified_path_viz_enable: true
+    simplified_path_viz_topic: "/asv5/track_path/simplified_path"
+
+    nav2_action_name: "/asv5/compute_path_to_pose"
+    nav2_is_path_valid_service: "/asv5/is_path_valid"
+    locomotion_action_name: "/asv5/controls"
+    pose_conversion_service_name: "/asv5/convert_to_controls_pose"
+
+    global_frame_id: "asv5/odom"
+    base_link_frame_id: "asv5/base_link"
+    odom_frame_id: "asv5/odom"

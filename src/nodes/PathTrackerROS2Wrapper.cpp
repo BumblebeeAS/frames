@@ -35,6 +35,7 @@ PathTrackerROS2Wrapper::PathTrackerROS2Wrapper(const std::string& name) : Node(n
     const bool click_goal_enable       = this->declare_parameter("click_goal_enable", false);
     const std::string click_goal_topic = this->declare_parameter("click_goal_topic", "click_goal");
     click_goal_2d_                     = this->declare_parameter("click_goal_2d", true);
+    click_goal_specified_heading_      = this->declare_parameter("click_goal_specified_heading", true);
 
     const bool simplified_path_viz_enable = this->declare_parameter("simplified_path_viz_enable", false);
     const std::string simplified_path_viz_topic
@@ -131,6 +132,7 @@ void PathTrackerROS2Wrapper::on_click_goal(const PoseStamped::SharedPtr msg) {
     TrackPath::Goal goal;
     goal.goal_pose              = *msg;
     goal.goal_pose.header.stamp = builtin_interfaces::msg::Time();  // latest TF, so replans never look up a stale stamp
+    goal.specified_heading      = click_goal_specified_heading_;
     if (click_goal_2d_) {
         tf2::Quaternion q;
         q.setRPY(0.0, 0.0, tf2::getYaw(msg->pose.orientation));
@@ -141,9 +143,10 @@ void PathTrackerROS2Wrapper::on_click_goal(const PoseStamped::SharedPtr msg) {
         goal.ignore_depth = false;
     }
 
-    RCLCPP_INFO(this->get_logger(), "Click goal: (%.2f, %.2f, %.2f) yaw %.1f deg in %s", goal.goal_pose.pose.position.x,
-                goal.goal_pose.pose.position.y, goal.goal_pose.pose.position.z,
-                tf2::getYaw(goal.goal_pose.pose.orientation) * 180.0 / M_PI, msg->header.frame_id.c_str());
+    RCLCPP_INFO(this->get_logger(), "Click goal: (%.2f, %.2f, %.2f) yaw %.1f deg in %s%s",
+                goal.goal_pose.pose.position.x, goal.goal_pose.pose.position.y, goal.goal_pose.pose.position.z,
+                tf2::getYaw(goal.goal_pose.pose.orientation) * 180.0 / M_PI, msg->header.frame_id.c_str(),
+                goal.specified_heading ? "" : ", heading unspecified");
     click_goal_client_->async_send_goal(goal);
 }
 
@@ -418,7 +421,13 @@ void PathTrackerROS2Wrapper::poll_plan() {
         on_plan_failed("path frame differs from global_frame_id");
         return;
     }
-    install_path(wrapped.result->path.poses);
+    // Theta* leaves pose headers empty; give them the path header as Smac does, since the conversion service
+    // transforms each pose by its own frame and pairs it with odometry by its stamp
+    std::vector<PoseStamped> poses = wrapped.result->path.poses;
+    for (auto& pose : poses) {
+        if (pose.header.frame_id.empty()) pose.header = wrapped.result->path.header;
+    }
+    install_path(poses);
 }
 
 void PathTrackerROS2Wrapper::on_plan_failed(const char* reason) {

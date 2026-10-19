@@ -19,6 +19,7 @@ path_tracker_node:
     click_goal_enable: true
     click_goal_topic: "/asv5/track_path/click_goal"
     click_goal_2d: true
+    click_goal_specified_heading: false
 
     simplified_path_viz_enable: true
     simplified_path_viz_topic: "/asv5/track_path/simplified_path"

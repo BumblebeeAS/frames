@@ -70,6 +70,7 @@ private:
     double stop_timeout_;
     int tf_failure_limit_;
     bool click_goal_2d_;
+    bool click_goal_specified_heading_;
     std::string global_frame_id_;
     std::string base_link_frame_id_;
 

@@ -30,6 +30,6 @@ replan_tracker_node:
     locomotion_action_name: "/asv5/controls"
     pose_conversion_service_name: "/asv5/convert_to_controls_pose"
 
-    global_frame_id: "asv5/odom"
+    global_frame_id: "asv5/map"
     base_link_frame_id: "asv5/base_link"
     odom_frame_id: "asv5/odom"

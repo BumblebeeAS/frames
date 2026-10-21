@@ -1,0 +1,41 @@
+/**/buoy_gate_manager_node:
+  ros__parameters:
+    buoy_geo_detections_topic: "buoy_geo_detections"
+    marker_topic: "gate_manager_markers"
+    # Absolute: navsat_transform_node runs in the root namespace
+    from_ll_array_service: "/fromLLArray"
+    to_ll_service: "/toLL"
+    service_timeout: 1.0
+    set_state_service: "set_gate_manager_state"
+    reset_service: "reset_tracks"
+    extract_goal_service: "extract_local_goal"
+    get_entry_service: "get_entry"
+    get_exit_service: "get_exit"
+    get_buoys_service: "get_buoys"
+    world_frame_id: "asv5/map"
+    base_link_frame_id: "asv5/base_link"
+
+    # Rate dependent: must match the real geo detection input rate (unknown for now)
+    fft_timer_period: 0.5
+    virtual_sampling_rate: 10.0
+    required_density: 0.8
+    dbscan_min_samples: 5
+
+    max_association_radius: 2.0
+    track_timeout: 60.0
+    butterworth_cutoff_freq: 3.0
+    butterworth_order: 4
+    target_freq: 0.5  # 1 s on / 1 s off
+    target_freq_tol: 0.1
+    duty_cycle_min: 0.1
+    duty_cycle_max: 0.85
+    consistent_threshold: 0.6
+    fft_min_magnitude: 0.15
+
+    max_gate_width: 4.0  # Gates are 3 m wide
+    singular_standoff: 1.0
+    waypoint_pass_tol: 1.0
+    visualize_candidates: true
+
+    offset_required_samples: 20
+    offset_outlier_gate: 5.0

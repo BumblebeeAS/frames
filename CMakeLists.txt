@@ -39,6 +39,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(robot_localization REQUIRED)
 ament_auto_find_build_dependencies()
 
 ament_auto_add_library(${PROJECT_NAME} include/${PROJECT_NAME}/)
@@ -121,6 +122,7 @@ ament_target_dependencies(path_tracker_replan
   nav2_msgs
   bb_controls_msgs
   bb_planner_msgs
+  robot_localization
   tf2
   tf2_ros
   tf2_geometry_msgs

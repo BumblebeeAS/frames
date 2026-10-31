@@ -16,6 +16,7 @@
 #include <optional>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
+#include <robot_localization/srv/from_ll.hpp>
 #include <string>
 #include <vector>
 
@@ -31,13 +32,14 @@ public:
     using Locomotion          = bb_controls_msgs::action::Locomotion;
     using IsPathValid         = nav2_msgs::srv::IsPathValid;
     using GetPose             = bb_planner_msgs::srv::GetPoseToControlsFrame;
+    using FromLL              = robot_localization::srv::FromLL;
     using PoseStamped         = geometry_msgs::msg::PoseStamped;
 
     explicit ReplanTrackerROS2Wrapper(const std::string& name);
 
 private:
     enum class State { IDLE, TRACKING, STOPPING };
-    enum class Stage { IDLE, PLANNING, CONVERTING };
+    enum class Stage { IDLE, RESOLVING, PLANNING, CONVERTING };
     enum class LocoEvent { NONE, SUCCEEDED, FAILED };
 
     // ROS 2 Interfaces
@@ -48,6 +50,7 @@ private:
     rclcpp_action::Client<Locomotion>::SharedPtr locomotion_action_client_;
     rclcpp::Client<IsPathValid>::SharedPtr is_path_valid_client_;
     rclcpp::Client<GetPose>::SharedPtr pose_conversion_client_;
+    rclcpp::Client<FromLL>::SharedPtr from_ll_client_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr simplified_path_pub_;  // null when disabled
 
     // GUI click goals, forwarded to our own action server
@@ -84,6 +87,7 @@ private:
     State state_ = State::IDLE;
     std::shared_ptr<GoalHandleTrackPath> active_;
     std::shared_ptr<GoalHandleTrackPath> pending_;
+    std::optional<PoseStamped> goal_pose_;  // empty until an LL goal is resolved
     int plan_failures_         = 0;
     int tf_failures_           = 0;
     double next_check_time_    = 0.0;
@@ -107,6 +111,7 @@ private:
     std::vector<PoseStamped> dense_;
     std::vector<double> dense_s_;
     std::vector<size_t> send_wps_;  // dense indices to send, start pose excluded
+    std::optional<rclcpp::Client<FromLL>::FutureAndRequestId> from_ll_future_;
 
     // Conversion (split requests are sequential)
     int conv_stage_  = 0;  // 1 first request, 2 second request
@@ -162,6 +167,8 @@ private:
 
     // Replan
     void request_plan();
+    void request_resolve();
+    void poll_resolve();
     void poll_plan();
     void on_plan_failed(const char* reason);
     void on_plan(const std::vector<PoseStamped>& poses);

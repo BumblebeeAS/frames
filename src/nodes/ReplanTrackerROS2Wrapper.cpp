@@ -47,6 +47,8 @@ ReplanTrackerROS2Wrapper::ReplanTrackerROS2Wrapper(const std::string& name) : No
     std::string locomotion_action_name     = this->declare_parameter("locomotion_action_name", "in/locomotion/poly");
     std::string pose_conversion_service_name
         = this->declare_parameter("pose_conversion_service_name", "convert_to_controls_pose");
+    std::string from_ll_service_name = this->declare_parameter("from_ll_service_name", "fromLL");
+    std::string action_server_name   = this->declare_parameter("action_server_name", "track_path");
 
     global_frame_id_    = this->declare_parameter("global_frame_id", "map");
     base_link_frame_id_ = this->declare_parameter("base_link_frame_id", "base_link");
@@ -62,7 +64,7 @@ ReplanTrackerROS2Wrapper::ReplanTrackerROS2Wrapper(const std::string& name) : No
 
     // Action Server
     action_server_ = rclcpp_action::create_server<TrackPath>(
-        this, "in/locomotion/track_path", std::bind(&ReplanTrackerROS2Wrapper::handle_goal, this, _1, _2),
+        this, action_server_name, std::bind(&ReplanTrackerROS2Wrapper::handle_goal, this, _1, _2),
         std::bind(&ReplanTrackerROS2Wrapper::handle_cancel, this, _1),
         std::bind(&ReplanTrackerROS2Wrapper::handle_accepted, this, _1), rcl_action_server_get_default_options(),
         server_cb_group_);
@@ -75,6 +77,7 @@ ReplanTrackerROS2Wrapper::ReplanTrackerROS2Wrapper(const std::string& name) : No
         = this->create_client<IsPathValid>(nav2_is_path_valid_service, rclcpp::ServicesQoS(), client_cb_group_);
     pose_conversion_client_
         = this->create_client<GetPose>(pose_conversion_service_name, rclcpp::ServicesQoS(), client_cb_group_);
+    from_ll_client_ = this->create_client<FromLL>(from_ll_service_name, rclcpp::ServicesQoS(), client_cb_group_);
 
     // Latched so a viewer that connects later still gets the current plan
     if (simplified_path_viz_enable) {
@@ -84,7 +87,7 @@ ReplanTrackerROS2Wrapper::ReplanTrackerROS2Wrapper(const std::string& name) : No
 
     // Clicks go through the action server so they behave exactly like an action call, preemption included
     if (click_goal_enable) {
-        click_goal_client_ = rclcpp_action::create_client<TrackPath>(this, "in/locomotion/track_path", client_cb_group_);
+        click_goal_client_ = rclcpp_action::create_client<TrackPath>(this, action_server_name, client_cb_group_);
         rclcpp::SubscriptionOptions click_options;
         click_options.callback_group = client_cb_group_;
         click_goal_sub_              = this->create_subscription<PoseStamped>(
@@ -104,7 +107,18 @@ double ReplanTrackerROS2Wrapper::now_s() const {
 rclcpp_action::GoalResponse ReplanTrackerROS2Wrapper::handle_goal(const rclcpp_action::GoalUUID& uuid,
                                                                   std::shared_ptr<const TrackPath::Goal> goal) {
     (void)uuid;
-    (void)goal;
+    bool valid = false;
+    if (goal->goal_type == TrackPath::Goal::GOAL_POSE) {
+        valid = !goal->goal_pose.header.frame_id.empty();
+    } else if (goal->goal_type == TrackPath::Goal::GOAL_LL) {
+        valid = std::isfinite(goal->goal_ll.latitude) && std::abs(goal->goal_ll.latitude) <= 90.0
+                && std::isfinite(goal->goal_ll.longitude) && std::abs(goal->goal_ll.longitude) <= 180.0
+                && std::isfinite(goal->goal_heading);
+    }
+    if (!valid) {
+        RCLCPP_ERROR(this->get_logger(), "Rejected invalid TrackPath goal (goal_type %u)", goal->goal_type);
+        return rclcpp_action::GoalResponse::REJECT;
+    }
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
 }
 
@@ -219,7 +233,14 @@ void ReplanTrackerROS2Wrapper::tick() {
         && now_s() >= next_check_time_) {
         run_checks(*pose);
     }
-    if (replan_needed_ && stage_ == Stage::IDLE && now_s() >= next_replan_time_) request_plan();
+    if (replan_needed_ && stage_ == Stage::IDLE && now_s() >= next_replan_time_) {
+        if (goal_pose_) {
+            request_plan();
+        } else {
+            request_resolve();
+        }
+    }
+    poll_resolve();
     poll_plan();
     if (state_ != State::TRACKING) return;
     poll_conversion(*pose);
@@ -243,7 +264,16 @@ void ReplanTrackerROS2Wrapper::start_goal(const std::shared_ptr<GoalHandleTrackP
     clear_cycle();
     clear_validity();
 
-    RCLCPP_INFO(this->get_logger(), "Starting TrackPath goal");
+    const auto goal = goal_handle->get_goal();
+    if (goal->goal_type == TrackPath::Goal::GOAL_LL) {
+        goal_pose_.reset();
+        RCLCPP_INFO(this->get_logger(), "Starting TrackPath goal (LL %.7f, %.7f, heading %.1f deg)",
+                    goal->goal_ll.latitude, goal->goal_ll.longitude, goal->goal_heading * 180.0 / M_PI);
+    } else {
+        goal_pose_ = goal->goal_pose;
+        RCLCPP_INFO(this->get_logger(), "Starting TrackPath goal (pose in %s)",
+                    goal->goal_pose.header.frame_id.c_str());
+    }
     state_ = State::TRACKING;
     request_replan("first send");
 }
@@ -259,6 +289,7 @@ void ReplanTrackerROS2Wrapper::terminate(uint8_t status) {
         active_->abort(result);
     }
     active_.reset();
+    goal_pose_.reset();
     clear_cycle();
     clear_validity();
     route_.clear();
@@ -432,12 +463,47 @@ void ReplanTrackerROS2Wrapper::request_plan() {
         return;
     }
     ComputePathToPose::Goal goal;
-    goal.goal           = active_->get_goal()->goal_pose;
+    goal.goal           = *goal_pose_;
     goal.use_start      = false;  // Use current robot pose
     plan_send_future_   = nav2_action_client_->async_send_goal(goal);
     plan_result_future_ = {};
     stage_              = Stage::PLANNING;
     stage_sent_time_    = now_s();
+}
+
+// An LL goal is resolved once, as the global frame is pinned to the navsat datum
+void ReplanTrackerROS2Wrapper::request_resolve() {
+    next_replan_time_ = now_s() + check_period_;
+    if (!from_ll_client_->service_is_ready()) {
+        on_plan_failed("fromLL service unavailable");
+        return;
+    }
+    auto request      = std::make_shared<FromLL::Request>();
+    request->ll_point = active_->get_goal()->goal_ll;
+    from_ll_future_.emplace(from_ll_client_->async_send_request(request));
+    stage_           = Stage::RESOLVING;
+    stage_sent_time_ = now_s();
+}
+
+void ReplanTrackerROS2Wrapper::poll_resolve() {
+    if (stage_ != Stage::RESOLVING) return;
+    if (!is_ready(*from_ll_future_)) {
+        if (now_s() - stage_sent_time_ > plan_timeout_) on_plan_failed("fromLL timed out");
+        return;
+    }
+    const auto point = from_ll_future_->get()->map_point;
+    clear_cycle();
+
+    PoseStamped pose;
+    pose.header.frame_id = global_frame_id_;  // zero stamp, latest TF
+    pose.pose.position   = point;
+    tf2::Quaternion q;
+    q.setRPY(0.0, 0.0, active_->get_goal()->goal_heading);
+    pose.pose.orientation = tf2::toMsg(q);
+    goal_pose_            = pose;
+    RCLCPP_INFO(this->get_logger(), "LL goal resolved to (%.2f, %.2f) in %s", point.x, point.y,
+                global_frame_id_.c_str());
+    request_plan();
 }
 
 void ReplanTrackerROS2Wrapper::poll_plan() {
@@ -622,6 +688,8 @@ void ReplanTrackerROS2Wrapper::clear_cycle() {
     plan_result_future_ = {};
     if (conv_future_) pose_conversion_client_->remove_pending_request(*conv_future_);
     conv_future_.reset();
+    if (from_ll_future_) from_ll_client_->remove_pending_request(*from_ll_future_);
+    from_ll_future_.reset();
     conv_stage_ = 0;
     stage_      = Stage::IDLE;
 }

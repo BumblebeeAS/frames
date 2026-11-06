@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from operator import attrgetter
+from copy import deepcopy
 
 import numpy as np
 import tf2_ros
@@ -86,7 +87,7 @@ def compose_transforms(f: Transform, g: Transform):
 
 def get_base_to_world_tf_stamped(odom_msg: Odometry) -> tf2_ros.TransformStamped:
     odom_transform = tf2_ros.TransformStamped()
-    odom_transform.header = odom_msg.header
+    odom_transform.header = deepcopy(odom_msg.header)
     odom_transform.transform.translation.x = odom_msg.pose.pose.position.x
     odom_transform.transform.translation.y = odom_msg.pose.pose.position.y
     odom_transform.transform.translation.z = odom_msg.pose.pose.position.z
@@ -118,7 +119,7 @@ def get_world_to_base_tf_stamped(
     translation_inv = translation_from_matrix(T_inv)
     rotation_inv = quaternion_from_matrix(T_inv)
     world_to_base_tf = tf2_ros.TransformStamped()
-    world_to_base_tf.header = odom_msg.header
+    world_to_base_tf.header = deepcopy(odom_msg.header)
     world_to_base_tf.header.frame_id = base_frame
 
     world_to_base_tf.transform.translation.x = translation_inv[0]

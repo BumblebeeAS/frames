@@ -16,15 +16,8 @@ from geometry_msgs.msg import PoseStamped, Quaternion
 from nav_msgs.msg import Odometry
 from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.qos import (
-    DurabilityPolicy,
-    HistoryPolicy,
-    QoSProfile,
-    ReliabilityPolicy,
-    qos_profile_sensor_data,
-)
+from rclpy.qos import qos_profile_sensor_data
 from tf2_geometry_msgs import do_transform_pose_stamped
-from tf2_msgs.msg import TFMessage
 from tf2_ros.buffer import Buffer
 from tf_transformations import quaternion_multiply
 
@@ -70,22 +63,12 @@ class ConvertToControlsPose(Node):
             .string_value
         )
 
+        self.prefer_odometry = self.declare_parameter("prefer_odometry", False).value
+
         # ------ Initialize subs and srv ------
-        static_qos = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
-        )
         self.tf_buffer: Buffer = Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.odom_buffer: deque[Odometry] = deque(maxlen=self.queue_size)
-        self.tf_sub = self.create_subscription(
-            TFMessage,
-            "/tf_static",
-            self.handle_tf_static,
-            qos_profile=static_qos,
-        )
         self.odom_sub = self.create_subscription(
             Odometry,
             self.odom_topic,
@@ -105,14 +88,6 @@ class ConvertToControlsPose(Node):
         self.get_logger().info(f"Using base frame: '{self.base_frame}'")
         self.get_logger().info(f"Using queue size: {self.queue_size}")
         self.get_logger().info(f"Using odom topic: {self.odom_topic}")
-
-    def handle_tf_static(self, msg: TFMessage) -> None:
-        """
-        Callback to set static transforms in the TF buffer.
-        """
-        self.get_logger().info("Received static TF transforms")
-        for tf in msg.transforms:
-            self.tf_buffer.set_transform_static(tf, "default_authority")
 
     def handle_odom(self, msg: Odometry) -> None:
         self.odom_buffer.append(msg)
@@ -159,6 +134,18 @@ class ConvertToControlsPose(Node):
         return after
 
     def lookup_with_fallback(self, target_frame: str, source_frame: str, timeout: float) -> tf2_ros.TransformStamped:
+        # When enabled, prefer odometry for the vehicle transform.
+        # Use TF for other frames requested by planning services.
+        if self.prefer_odometry and self.odom_buffer:
+            odom = self.odom_buffer[-1]
+            if (target_frame, source_frame) == (odom.header.frame_id, odom.child_frame_id):
+                transform = get_base_to_world_tf_stamped(odom)
+                transform.child_frame_id = odom.child_frame_id
+                return transform
+            if (source_frame, target_frame) == (odom.header.frame_id, odom.child_frame_id):
+                transform = get_world_to_base_tf_stamped(odom, odom.child_frame_id)
+                transform.child_frame_id = odom.header.frame_id
+                return transform
         try:
             return self.tf_buffer.lookup_transform(
                 target_frame=target_frame,

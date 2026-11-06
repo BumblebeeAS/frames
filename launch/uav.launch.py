@@ -16,6 +16,7 @@ def generate_launch_description():
                     "base_frame": "uav/base_link_frd",
                     "queue_size": 100,
                     "odom_topic": "/uav/odom_home_ned",
+                    "prefer_odometry": True,
                 }
             ],
             output="screen",

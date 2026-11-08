@@ -4,7 +4,6 @@ import json
 import time
 
 import numpy as np
-from std_msgs.msg import String
 
 
 def stamp_ns(message):
@@ -12,11 +11,10 @@ def stamp_ns(message):
 
 
 class SyncDiagnostics:
-    """Bounded summaries and per-match JSON; arrival age is separate from skew."""
+    """Periodically summarize matched-pair skew separately from arrival age."""
 
     def __init__(self, node):
         self.node = node
-        self.publisher = node.create_publisher(String, '~/sync_diagnostics', 100)
         self.samples = defaultdict(lambda: deque(maxlen=2000))
         self.last_log = time.monotonic()
 
@@ -28,10 +26,6 @@ class SyncDiagnostics:
         delta_s = (odometry_ns - observation_ns) / 1e9
         age_s = (self.node.get_clock().now().nanoseconds - observation_ns) / 1e9
         self.samples[stream].append((abs(delta_s), age_s))
-        self.publisher.publish(String(data=json.dumps(dict(
-            event='sync_pair', node=self.node.get_fully_qualified_name(), stream=stream,
-            observation_stamp_ns=observation_ns, odometry_stamp_ns=odometry_ns,
-            odom_minus_observation_s=delta_s, observation_arrival_age_s=age_s))))
         if time.monotonic() - self.last_log >= 5.:
             self.log_summary()
 

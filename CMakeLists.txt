@@ -176,6 +176,10 @@ if(BUILD_TESTING)
   set(ament_cmake_lint_cmake_FOUND TRUE)
   set(ament_cmake_uncrustify_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_path_headings tests/src/test_path_headings.cpp)
+  ament_target_dependencies(test_path_headings geometry_msgs)
 endif()
 
 # install(DIRECTORY include/${PROJECT_NAME}/ DESTINATION include/${PROJECT_NAME}/)

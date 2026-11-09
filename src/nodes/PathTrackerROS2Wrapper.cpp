@@ -1,4 +1,5 @@
 #include "nodes/PathTrackerROS2Wrapper.h"
+#include "nodes/path_headings.h"
 
 #include <algorithm>
 #include <chrono>
@@ -445,6 +446,7 @@ void PathTrackerROS2Wrapper::on_plan_failed(const char* reason) {
 
 void PathTrackerROS2Wrapper::install_path(const std::vector<PoseStamped>& poses) {
     dense_ = poses;
+    path_headings::assign_travel_headings(dense_);
     dense_s_.assign(dense_.size(), 0.0);
     for (size_t i = 1; i < dense_.size(); ++i) {
         dense_s_[i] = dense_s_[i - 1] + planar_distance(dense_[i - 1].pose.position, dense_[i].pose.position);

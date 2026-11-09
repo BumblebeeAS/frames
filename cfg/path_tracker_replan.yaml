@@ -30,7 +30,7 @@ replan_tracker_node:
     nav2_is_path_valid_service: "/asv5/is_path_valid"
     locomotion_action_name: "/asv5/controls"
     pose_conversion_service_name: "/asv5/convert_to_controls_pose"
-    from_ll_service_name: "/fromLL"
+    from_ll_service_name: "/asv5/fromLL"
 
     global_frame_id: "asv5/map"
     base_link_frame_id: "asv5/base_link"

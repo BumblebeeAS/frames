@@ -2,9 +2,9 @@
   ros__parameters:
     buoy_geo_detections_topic: "buoy_geo_detections"
     marker_topic: "gate_manager_markers"
-    # Absolute: navsat_transform_node runs in the root namespace
-    from_ll_array_service: "/fromLLArray"
-    to_ll_service: "/toLL"
+    # asv5 navsat_transform (localization), namespaced clear of the drone's
+    from_ll_array_service: "/asv5/fromLLArray"
+    to_ll_service: "/asv5/toLL"
     service_timeout: 1.0
     set_state_service: "set_gate_manager_state"
     reset_service: "reset_tracks"

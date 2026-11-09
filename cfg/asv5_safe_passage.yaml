@@ -1,0 +1,46 @@
+# RobotX 2026 Task 1 (Safe Passage) on asv5: scripts/safe_passage_node.py, action /asv5/safe_passage.
+# Frames: planning in asv5/map (ENU). Encircle centre goes through convert_to_controls_pose into odom NED.
+safe_passage_node:
+  ros__parameters:
+    action_name: "/asv5/safe_passage"
+    # Drone's buoy gate manager (pose_estimator), best effort and volatile: only live paths are taken
+    path_topic: "/uav/safe_passage/path"
+    path_wait_timeout: 30.0
+    # localization cfg/asv5_nav2.yaml: global_costmap in asv5/map, 0.1 m, STVL 25 m range, 5 s decay
+    costmap_topic: "/asv5/global_costmap/costmap"
+    global_frame_id: "asv5/map"
+    base_link_frame_id: "asv5/base_link"
+    track_path_action: "/asv5/track_path"
+    encircle_action: "/asv5/in/locomotion/encircle"  # controls' encircle server, not remapped
+    from_ll_service: "/asv5/fromLL"
+    convert_to_controls_pose_service: "/asv5/convert_to_controls_pose"
+    service_timeout: 2.0
+
+    # Circles: R picked from circle_radius +- circle_radius_tol, centre snapped onto lidar-seen lethal cells
+    circle_radius: 2.5
+    circle_radius_tol: 0.5
+    circle_overshoot_deg: 20.0     # sweep past 360 so the circle counts as full
+    snap_radius: 1.0
+    approach_offset: 1.5           # approach ring = R + approach_offset, Encircle joins tangentially from there
+    approach_step_deg: 30.0
+    circle_tolerance: 1.0
+    circle_heading_tolerance: 0.52  # rad
+    circle_max_correction_time: 5
+    circle_timeout: 180.0
+    circle_max_xy_vel: -1.0         # controls default
+
+    # Pass-through points. sample_radius must stay below the manager's standoff distance.
+    sample_radius: 1.0
+    sample_rings: 2
+    sample_per_ring: 8
+    lead_distance: 1.5             # before/after points along the crossing direction, 0 disables
+    cost_threshold: 50             # OccupancyGrid scale: 99 inscribed, 100 lethal
+    check_spacing: 0.2
+
+    # TrackPath (replan tracker), specified_heading false
+    waypoint_tolerance: 1.0
+    waypoint_stabilize: 0
+    approach_tolerance: 1.0        # below approach_offset so the approach ends outside the circle
+    approach_stabilize: 2
+    max_replans: 10
+    leg_timeout: 120.0

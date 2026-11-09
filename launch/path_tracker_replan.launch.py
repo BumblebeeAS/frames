@@ -4,11 +4,7 @@ from launch import LaunchDescription
 from launch_ros.actions import Node
 
 def generate_launch_description():
-    config_file = os.path.join(
-        get_package_share_directory('frames'),
-        'cfg',
-        'path_tracker_replan.yaml'
-    )
+    cfg_dir = os.path.join(get_package_share_directory('frames'), 'cfg')
 
     return LaunchDescription([
         Node(
@@ -16,6 +12,14 @@ def generate_launch_description():
             executable='path_tracker_replan',
             name='replan_tracker_node',
             output='screen',
-            parameters=[config_file]
-        )
+            parameters=[os.path.join(cfg_dir, 'path_tracker_replan.yaml')]
+        ),
+        # Task 1 safe passage server (/asv5/safe_passage): a TrackPath client of the tracker above
+        Node(
+            package='frames',
+            executable='safe_passage_node.py',
+            name='safe_passage_node',
+            output='screen',
+            parameters=[os.path.join(cfg_dir, 'asv5_safe_passage.yaml')]
+        ),
     ])

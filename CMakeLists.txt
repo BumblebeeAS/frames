@@ -151,6 +151,7 @@ install(PROGRAMS
   scripts/convert_to_controls_pose.py
   scripts/static_tfs_node.py
   scripts/buoy_gate_manager_node.py
+  scripts/safe_passage_node.py
   DESTINATION lib/${PROJECT_NAME})
 
 # Install launch files

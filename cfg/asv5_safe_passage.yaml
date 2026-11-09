@@ -4,7 +4,7 @@ safe_passage_node:
   ros__parameters:
     action_name: "/asv5/safe_passage"
     # Drone's buoy gate manager (pose_estimator), best effort and volatile: only live paths are taken
-    path_topic: "/uav/safe_passage/path"
+    path_topic: "/uav/buoy/safe_passage/path"
     path_wait_timeout: 30.0
     # localization cfg/asv5_nav2.yaml: global_costmap in asv5/map, 0.1 m, STVL 25 m range, 5 s decay
     costmap_topic: "/asv5/global_costmap/costmap"

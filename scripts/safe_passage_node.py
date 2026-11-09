@@ -66,7 +66,7 @@ class SafePassageNode(Node):
         super().__init__("safe_passage_node")
         param = lambda name, default: self.declare_parameter(name, default).value  # noqa: E731
 
-        self.path_topic = param("path_topic", "/uav/safe_passage/path")
+        self.path_topic = param("path_topic", "/uav/buoy/safe_passage/path")
         self.path_wait_timeout = param("path_wait_timeout", 30.0)
         self.costmap_topic = param("costmap_topic", "/asv5/global_costmap/costmap")
         self.global_frame_id = param("global_frame_id", "asv5/map")

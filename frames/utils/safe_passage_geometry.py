@@ -106,21 +106,28 @@ def tangent_point(centre, radius: float, start, clockwise: bool) -> np.ndarray:
     return centre + radius * np.array([math.cos(phi), math.sin(phi)])
 
 
+def _near_any(point: np.ndarray, others, radius: float) -> bool:
+    return any(np.linalg.norm(point - np.asarray(o, dtype=float)[:2]) <= radius for o in others)
+
+
 def choose_approach(grid: CostGrid, centre, radius: float, offset: float, boat, clockwise: bool,
-                    threshold: int, step_deg: float = 30.0, spacing: float = 0.2) -> np.ndarray:
+                    threshold: int, step_deg: float = 30.0, spacing: float = 0.2,
+                    exclude=(), exclude_radius: float = 1.0) -> np.ndarray:
     """Point on the radius + offset ring to drive to before circling.
 
     Candidates go round from the boat's bearing to the centre, nearest first. Each is scored on its own cost and the
     straight run Encircle then makes to its tangent point; the first under threshold wins, else the cheapest.
+    Candidates within exclude_radius of an exclude point (failed targets) are skipped, unless that skips them all.
     """
     centre, boat = np.asarray(centre, dtype=float)[:2], np.asarray(boat, dtype=float)[:2]
     ring = radius + offset
     bearing = math.atan2(*(boat - centre)[::-1]) if np.linalg.norm(boat - centre) > 0 else 0.0
     steps = max(1, round(360.0 / step_deg))
     deltas = sorted((math.radians(step_deg) * k for k in range(-(steps // 2), steps - steps // 2)), key=abs)
+    points = [centre + ring * np.array([math.cos(bearing + d), math.sin(bearing + d)]) for d in deltas]
+    allowed = [(d, p) for d, p in zip(deltas, points) if not _near_any(p, exclude, exclude_radius)]
     scored = []
-    for delta in deltas:
-        point = centre + ring * np.array([math.cos(bearing + delta), math.sin(bearing + delta)])
+    for delta, point in allowed or list(zip(deltas, points)):
         run = segment(point, tangent_point(centre, radius, point, clockwise), spacing)
         score = max(grid.max_cost_along(point), grid.max_cost_along(run))
         if score < threshold:
@@ -129,10 +136,13 @@ def choose_approach(grid: CostGrid, centre, radius: float, offset: float, boat, 
     return min(scored, key=lambda item: item[:2])[2]
 
 
-def sample_point(grid: CostGrid, nominal, radius: float, rings: int = 2, per_ring: int = 8) -> np.ndarray:
+def sample_point(grid: CostGrid, nominal, radius: float, rings: int = 2, per_ring: int = 8,
+                 ahead_of=None) -> np.ndarray:
     """Cheapest of nominal and rings of candidates within radius, ties to the nearest to nominal.
 
     Keep radius below the standoff distance so a standoff sample stays on its side of the buoy.
+    ahead_of=(point, direction, min_gap) keeps only candidates at least min_gap past point along the unit direction,
+    unless none are.
     """
     nominal = np.asarray(nominal, dtype=float)[:2]
     candidates = [nominal]
@@ -140,6 +150,11 @@ def sample_point(grid: CostGrid, nominal, radius: float, rings: int = 2, per_rin
         r = radius * k / rings
         candidates += [nominal + r * np.array([math.cos(a), math.sin(a)])
                        for a in np.linspace(0.0, 2.0 * math.pi, per_ring, endpoint=False)]
+    if ahead_of is not None:
+        point, direction, min_gap = ahead_of
+        point, direction = np.asarray(point, dtype=float)[:2], np.asarray(direction, dtype=float)[:2]
+        # 1e-9: the worst case lands exactly on min_gap
+        candidates = [c for c in candidates if np.dot(c - point, direction) >= min_gap - 1e-9] or candidates
     costs = grid.cost(np.array(candidates))
     best = min(range(len(candidates)), key=lambda i: (costs[i], np.linalg.norm(candidates[i] - nominal)))
     return candidates[best]

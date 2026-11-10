@@ -30,10 +30,10 @@ safe_passage_node:
     circle_max_xy_vel: -1.0         # controls default
 
     # Pass-through points. sample_radius must stay below the manager's standoff distance.
-    sample_radius: 1.0
+    sample_radius: 0.75            # below lead_distance so before < middle < after along the crossing
     sample_rings: 2
     sample_per_ring: 8
-    lead_distance: 1.5             # before/after points along the crossing direction, 0 disables
+    lead_distance: 1.0             # before/after points along the crossing direction, 0 disables
     cost_threshold: 50             # OccupancyGrid scale: 99 inscribed, 100 lethal
     check_spacing: 0.2
 
@@ -42,5 +42,7 @@ safe_passage_node:
     waypoint_stabilize: 0
     approach_tolerance: 1.0        # below approach_offset so the approach ends outside the circle
     approach_stabilize: 2
-    max_replans: 10
-    leg_timeout: 120.0
+    max_replans: 5                 # tracker gives up after 6 planning failures in a row, then we resample
+    leg_timeout: 60.0              # per attempt
+    track_retries: 2               # extra attempts per TrackPath movement, each on a fresh snapshot
+    approach_exclude_radius: 1.0   # a retried approach skips ring points this close to a failed one

@@ -11,8 +11,10 @@ the legs in order:
   EXIT_APPROACH   TrackPath to a free point outside the exit circle
   EXIT_CIRCLE     Encircle counterclockwise, one round plus overshoot
 
-Each leg samples against its own snapshot of the global costmap (frames.utils.safe_passage_geometry), taken when the
-leg starts. A failed or timed out leg is logged and skipped: only a missing path aborts the goal.
+Each TrackPath attempt samples its target on a fresh snapshot of the global costmap (frames.utils.safe_passage_geometry);
+a failed attempt is retried up to track_retries times, an approach skipping ring points near the ones that failed.
+Circle centres and radii are fixed once per circle. A leg that fails every attempt is logged and skipped: only a
+missing path aborts the goal.
 
 Conventions: the path is WGS84; everything is planned in global_frame_id (asv5/map, ENU) and TrackPath goals are
 GOAL_POSE there with specified_heading false. Encircle takes its centre in the controls frame (odom NED, x north,
@@ -87,10 +89,10 @@ class SafePassageNode(Node):
         self.circle_max_xy_vel = param("circle_max_xy_vel", -1.0)
 
         # Pass-through points. Keep sample_radius below the manager's standoff distance.
-        self.sample_radius = param("sample_radius", 1.0)
+        self.sample_radius = param("sample_radius", 0.75)
         self.sample_rings = param("sample_rings", 2)
         self.sample_per_ring = param("sample_per_ring", 8)
-        self.lead_distance = param("lead_distance", 1.5)
+        self.lead_distance = param("lead_distance", 1.0)
         self.cost_threshold = param("cost_threshold", 50)
         self.check_spacing = param("check_spacing", 0.2)
 
@@ -99,8 +101,11 @@ class SafePassageNode(Node):
         self.waypoint_stabilize = param("waypoint_stabilize", 0)
         self.approach_tolerance = param("approach_tolerance", 1.0)  # below approach_offset: stop outside the circle
         self.approach_stabilize = param("approach_stabilize", 2)
-        self.max_replans = param("max_replans", 10)
-        self.leg_timeout = param("leg_timeout", 120.0)
+        self.max_replans = param("max_replans", 5)
+        self.leg_timeout = param("leg_timeout", 60.0)  # per attempt
+        # Every TrackPath movement: a failed attempt resamples its target on a fresh snapshot, up to this many times
+        self.track_retries = param("track_retries", 2)
+        self.approach_exclude_radius = param("approach_exclude_radius", 1.0)  # ring points near a failed approach
 
         if self.sample_radius >= self.lead_distance > 0:
             self.get_logger().warning("sample_radius >= lead_distance: before/after samples may swap order")
@@ -176,13 +181,12 @@ class SafePassageNode(Node):
         total = len(waypoints)
         self.get_logger().info(f"Path: entry {entry.round(1)}, {total} pass-through point(s), exit {exit_.round(1)}")
 
-        # Entry
+        # Entry: centre and R fixed from one snapshot, the approach target resampled per attempt
         feedback("ENTRY_APPROACH", 0, total)
         grid = self._snapshot()
         centre = geo.snap_centre(grid, entry, self.snap_radius)
         radius = geo.choose_radius(grid, centre, self.circle_radius, self.circle_radius_tol, spacing=self.check_spacing)
-        boat = self._boat_xy()
-        if boat is None or not self._approach(goal_handle, grid, centre, radius, boat, clockwise=True):
+        if not self._approach(goal_handle, "ENTRY_APPROACH", centre, radius, clockwise=True):
             failed.append("ENTRY_APPROACH")
         feedback("ENTRY_CIRCLE", 0, total)
         if not self._circle(goal_handle, centre, radius, geo.circle_turn_deg(True, self.circle_overshoot_deg)):
@@ -192,26 +196,16 @@ class SafePassageNode(Node):
         nominal = [entry, *waypoints, exit_]
         for i, point in enumerate(waypoints):
             feedback("WAYPOINT", i, total)
-            grid = self._snapshot()
-            middle = geo.sample_point(grid, point, self.sample_radius, self.sample_rings, self.sample_per_ring)
             d = geo.crossing_direction(nominal[i], nominal[i + 2])
             yaw = math.atan2(d[1], d[0])
-            legs = [middle]
-            if self.lead_distance > 0:
-                legs = [geo.sample_point(grid, middle + s * self.lead_distance * d, self.sample_radius,
-                                         self.sample_rings, self.sample_per_ring) for s in (-1.0, 1.0)]
-                legs.insert(1, middle)
-            for j, leg in enumerate(legs):
-                if not self._track(goal_handle, leg, yaw, self.waypoint_tolerance, self.waypoint_stabilize):
-                    failed.append(f"WAYPOINT {i + 1} leg {j + 1}")
+            failed += self._pass_through(goal_handle, i + 1, point, d, yaw)
 
         # Exit
         feedback("EXIT_APPROACH", total, total)
         grid = self._snapshot()
         centre = geo.snap_centre(grid, exit_, self.snap_radius)
         radius = geo.choose_radius(grid, centre, self.circle_radius, self.circle_radius_tol, spacing=self.check_spacing)
-        boat = self._boat_xy()
-        if boat is None or not self._approach(goal_handle, grid, centre, radius, boat, clockwise=False):
+        if not self._approach(goal_handle, "EXIT_APPROACH", centre, radius, clockwise=False):
             failed.append("EXIT_APPROACH")
         feedback("EXIT_CIRCLE", total, total)
         if not self._circle(goal_handle, centre, radius, geo.circle_turn_deg(False, self.circle_overshoot_deg)):
@@ -221,13 +215,65 @@ class SafePassageNode(Node):
 
     # Legs
 
-    def _approach(self, goal_handle, grid, centre, radius, boat, clockwise: bool) -> bool:
-        point = geo.choose_approach(grid, centre, radius, self.approach_offset, boat, clockwise, self.cost_threshold,
-                                    self.approach_step_deg, self.check_spacing)
-        # End facing the tangent point Encircle joins at, so its first turn is small
-        run = geo.tangent_point(centre, radius, point, clockwise) - point
-        return self._track(goal_handle, point, math.atan2(run[1], run[0]), self.approach_tolerance,
-                           self.approach_stabilize)
+    def _approach(self, goal_handle, label: str, centre, radius, clockwise: bool) -> bool:
+        def pick(grid, failed):
+            boat = self._boat_xy()
+            if boat is None:
+                return None
+            point = geo.choose_approach(grid, centre, radius, self.approach_offset, boat, clockwise,
+                                        self.cost_threshold, self.approach_step_deg, self.check_spacing,
+                                        exclude=failed, exclude_radius=self.approach_exclude_radius)
+            # End facing the tangent point Encircle joins at, so its first turn is small
+            run = geo.tangent_point(centre, radius, point, clockwise) - point
+            return point, math.atan2(run[1], run[0])
+
+        ok, _ = self._track_resampled(goal_handle, label, pick, self.approach_tolerance, self.approach_stabilize)
+        return ok
+
+    def _pass_through(self, goal_handle, n: int, point, d, yaw: float) -> list[str]:
+        """before -> middle -> after through point along d, each sampled on its own snapshot; returns failed legs.
+
+        before sits lead_distance behind the middle as sampled now, middle stays min_gap past the before used, after
+        sits lead_distance past the middle used. Without a lead only the middle is driven."""
+        lead = self.lead_distance
+        failed: list[str] = []
+
+        def sample(grid, xy, ahead_of=None):
+            return geo.sample_point(grid, xy, self.sample_radius, self.sample_rings, self.sample_per_ring, ahead_of)
+
+        def leg(label, target):
+            ok, used = self._track_resampled(goal_handle, label, lambda grid, _failed: (target(grid), yaw),
+                                             self.waypoint_tolerance, self.waypoint_stabilize)
+            if not ok:
+                failed.append(label)
+            return used
+
+        if lead <= 0:
+            leg(f"WAYPOINT {n} leg 1", lambda grid: sample(grid, point))
+            return failed
+        before = leg(f"WAYPOINT {n} leg 1", lambda grid: sample(grid, sample(grid, point) - lead * d))
+        ahead_of = (before, d, lead - self.sample_radius)
+        middle = leg(f"WAYPOINT {n} leg 2", lambda grid: sample(grid, point, ahead_of))
+        leg(f"WAYPOINT {n} leg 3", lambda grid: sample(grid, middle + lead * d))
+        return failed
+
+    def _track_resampled(self, goal_handle, label: str, pick: Callable, tolerance: float, stabilize: int):
+        """TrackPath to pick(grid, failed) -> (xy, yaw) or None, on a fresh costmap snapshot every attempt.
+
+        failed holds the targets already tried. Up to 1 + track_retries attempts; returns (ok, last target tried)."""
+        attempts = 1 + max(0, int(self.track_retries))
+        failed: list[np.ndarray] = []
+        last = None
+        for attempt in range(1, attempts + 1):
+            self._check_cancel(goal_handle)
+            picked = pick(self._snapshot(), failed)
+            if picked is not None:
+                last, yaw = picked
+                if self._track(goal_handle, last, yaw, tolerance, stabilize):
+                    return True, last
+                failed.append(last)
+            self.get_logger().warning(f"{label} attempt {attempt}/{attempts} failed")
+        return False, last
 
     def _track(self, goal_handle, xy, yaw: float, tolerance: float, stabilize: int) -> bool:
         """TrackPath to xy. yaw (ENU) is where it ends facing: with specified_heading false the vehicle still turns
@@ -385,7 +431,8 @@ class SafePassageNode(Node):
     def _snapshot(self) -> geo.CostGrid:
         msg = self._costmap
         if msg is None:
-            self.get_logger().warning(f"No costmap on {self.costmap_topic}, sampling on an empty one")
+            self.get_logger().warning(f"No costmap on {self.costmap_topic}, sampling on an empty one",
+                                      throttle_duration_sec=5.0)
             return geo.CostGrid.empty()
         if msg.header.frame_id != self.global_frame_id:
             self.get_logger().warning(f"Costmap in '{msg.header.frame_id}', not '{self.global_frame_id}': ignored")

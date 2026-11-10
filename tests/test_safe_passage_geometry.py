@@ -100,3 +100,44 @@ def test_circles_are_one_round_plus_overshoot():
 def test_crossing_direction():
     assert np.allclose(geo.crossing_direction([0, 0], [0, 4]), [0, 1])
     assert np.allclose(geo.crossing_direction([1, 1], [1, 1]), [1, 0])
+
+
+def test_approach_retry_skips_failed_ring_points():
+    kwargs = dict(centre=[0, 0], radius=2.5, offset=1.5, boat=[0, -10], clockwise=True, threshold=50)
+    first = geo.choose_approach(EMPTY, **kwargs)
+    assert np.allclose(geo.choose_approach(EMPTY, exclude=(), **kwargs), first)
+    retry = geo.choose_approach(EMPTY, exclude=[first], exclude_radius=1.0, **kwargs)
+    assert np.linalg.norm(retry) == pytest.approx(4.0)
+    assert np.linalg.norm(retry - first) == pytest.approx(2 * 4.0 * math.sin(math.radians(15)))  # next ring point
+    # Everything excluded: back to the unfiltered choice
+    assert np.allclose(geo.choose_approach(EMPTY, exclude=[[0, 0]], exclude_radius=10.0, **kwargs), first)
+
+
+def test_sample_ahead_of_keeps_the_order():
+    assert np.allclose(geo.sample_point(EMPTY, [0, 0], 0.75, ahead_of=None), [0, 0])
+    ahead = geo.sample_point(EMPTY, [0, 0], 0.75, ahead_of=([0.5, 0.0], [1.0, 0.0], 0.25))
+    assert ahead[0] >= 0.75 - 1e-9
+    # Nothing far enough ahead: falls back to every candidate
+    assert np.allclose(geo.sample_point(EMPTY, [0, 0], 0.75, ahead_of=([5.0, 0.0], [1.0, 0.0], 0.0)), [0, 0])
+
+
+def test_before_middle_after_stay_in_order_across_snapshots():
+    rng = np.random.default_rng(0)
+    lead, radius = 1.0, 0.75
+    d = np.array([1.0, 0.0])
+    sample = lambda grid, xy, ahead_of=None: geo.sample_point(grid, xy, radius, ahead_of=ahead_of)  # noqa: E731
+    for _ in range(200):
+        a, b, c = (grid_with([tuple(rng.uniform(-1.5, 1.5, 2))]) for _ in range(3))  # a new snapshot per leg
+        point = np.zeros(2)
+        before = sample(a, sample(a, point) - lead * d)
+        middle = sample(b, point, (before, d, lead - radius))
+        after = sample(c, middle + lead * d)
+        assert np.dot(before, d) < np.dot(middle, d) < np.dot(after, d)
+
+
+def test_ahead_of_keeps_the_exact_min_gap_candidate():
+    # Worst case: before 0.5 m past the nominal, the only valid middle is the 0.75 m ring point along d (diagonal d
+    # so the dot product rounds)
+    d = np.array([1.0, 1.0]) / math.sqrt(2.0)
+    middle = geo.sample_point(EMPTY, [0, 0], 0.75, ahead_of=(0.5 * d, d, 0.25))
+    assert np.allclose(middle, 0.75 * d)

@@ -20,7 +20,10 @@ replan_tracker_node:
     # Goal sampling, for goals with sample_radius > 0 in global_frame_id
     costmap_topic: "/asv5/global_costmap/costmap"  # subscribed only while such a goal runs
     sample_spacing: 0.25  # m between rings and along them
-    sample_cost_threshold: 17  # grid value (0..100); 17 keeps the hull's circumscribed radius clear at the current inflation
+    # Grid value (0..100). Radius mode (robot_radius 0.75, inflation 1.25, scaling 5): 22 = centre >= 1.05 m from
+    # a mark, i.e. the radius plus a 0.3 m stopping tolerance, so the boat stopping short of the target still starts
+    # the next plan outside the inscribed band. 98 is the validity floor (0.75 m), 50 = 0.89 m.
+    sample_cost_threshold: 22
     costmap_max_age: 2.0  # s
 
     # RobotX Task 4: hold a goal inside a keep-out zone until it clears (bb_localization keepout_zones.py)

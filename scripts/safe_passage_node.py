@@ -13,8 +13,14 @@ the legs in order:
 
 Each TrackPath attempt samples its target on a fresh snapshot of the global costmap (frames.utils.safe_passage_geometry);
 a failed attempt is retried up to track_retries times, an approach skipping ring points near the ones that failed.
-Circle centres and radii are fixed once per circle. A leg that fails every attempt is logged and skipped: only a
-missing path aborts the goal.
+A circle's centre and radius are placed before its approach, then placed again right before the circle around that
+centre, on a snapshot from the end of the approach: the first snapshot is taken wherever the boat is, often with the
+buoy out of lidar range. A leg that fails every attempt is logged and skipped: only a missing path aborts the goal.
+
+While any keep-out zone is active (RobotX Task 4, keepout_mask_topic) it holds, with no timeout of its own, before
+every costmap snapshot used for a circle, every TrackPath attempt and every circle, then for a costmap published
+zone_clear_settle after the zone cleared, so zone cells are never taken for buoys or sampled around. The tree's
+timeout or a cancel ends the hold.
 
 Conventions: the path is WGS84; everything is planned in global_frame_id (asv5/map, ENU) and TrackPath goals are
 GOAL_POSE there with specified_heading false. Encircle takes its centre in the controls frame (odom NED, x north,
@@ -74,6 +80,8 @@ class SafePassageNode(Node):
         self.global_frame_id = param("global_frame_id", "asv5/map")
         self.base_link_frame_id = param("base_link_frame_id", "asv5/base_link")
         self.service_timeout = param("service_timeout", 2.0)
+        self.keepout_mask_topic = param("keepout_mask_topic", "/asv5/keepout_mask")  # empty: never hold
+        self.zone_clear_settle = param("zone_clear_settle", 1.0)  # s, the global costmap updates at 2 Hz
 
         # Circles
         self.circle_radius = param("circle_radius", 2.5)
@@ -119,6 +127,10 @@ class SafePassageNode(Node):
         self._costmap: Optional[OccupancyGrid] = None
         self.create_subscription(OccupancyGrid, self.costmap_topic, self._on_costmap, COSTMAP_QOS,
                                  callback_group=self.cb_group)
+        self._zone_active = False  # set by the mask callback, read by the goal thread
+        if self.keepout_mask_topic:
+            self.create_subscription(OccupancyGrid, self.keepout_mask_topic, self._on_keepout_mask, COSTMAP_QOS,
+                                     callback_group=self.cb_group)
 
         self.track_path_name = param("track_path_action", "/asv5/track_path")
         self.encircle_name = param("encircle_action", "/asv5/in/locomotion/encircle")
@@ -181,14 +193,16 @@ class SafePassageNode(Node):
         total = len(waypoints)
         self.get_logger().info(f"Path: entry {entry.round(1)}, {total} pass-through point(s), exit {exit_.round(1)}")
 
-        # Entry: centre and R fixed from one snapshot, the approach target resampled per attempt
+        # Entry: centre and R placed for the approach, placed again for the circle; the approach target resampled
+        # per attempt
         feedback("ENTRY_APPROACH", 0, total)
-        grid = self._snapshot()
-        centre = geo.snap_centre(grid, entry, self.snap_radius)
-        radius = geo.choose_radius(grid, centre, self.circle_radius, self.circle_radius_tol, spacing=self.check_spacing)
+        self._wait_while_zone(goal_handle, "ENTRY_APPROACH")
+        centre, radius = self._place_circle(self._snapshot(), entry)
         if not self._approach(goal_handle, "ENTRY_APPROACH", centre, radius, clockwise=True):
             failed.append("ENTRY_APPROACH")
         feedback("ENTRY_CIRCLE", 0, total)
+        self._wait_while_zone(goal_handle, "ENTRY_CIRCLE")
+        centre, radius = self._replace_circle("ENTRY_CIRCLE", centre)
         if not self._circle(goal_handle, centre, radius, geo.circle_turn_deg(True, self.circle_overshoot_deg)):
             failed.append("ENTRY_CIRCLE")
 
@@ -202,18 +216,32 @@ class SafePassageNode(Node):
 
         # Exit
         feedback("EXIT_APPROACH", total, total)
-        grid = self._snapshot()
-        centre = geo.snap_centre(grid, exit_, self.snap_radius)
-        radius = geo.choose_radius(grid, centre, self.circle_radius, self.circle_radius_tol, spacing=self.check_spacing)
+        self._wait_while_zone(goal_handle, "EXIT_APPROACH")
+        centre, radius = self._place_circle(self._snapshot(), exit_)
         if not self._approach(goal_handle, "EXIT_APPROACH", centre, radius, clockwise=False):
             failed.append("EXIT_APPROACH")
         feedback("EXIT_CIRCLE", total, total)
+        self._wait_while_zone(goal_handle, "EXIT_CIRCLE")
+        centre, radius = self._replace_circle("EXIT_CIRCLE", centre)
         if not self._circle(goal_handle, centre, radius, geo.circle_turn_deg(False, self.circle_overshoot_deg)):
             failed.append("EXIT_CIRCLE")
 
         return not failed, ("all legs succeeded" if not failed else "failed: " + ", ".join(failed))
 
     # Legs
+
+    def _place_circle(self, grid: geo.CostGrid, around) -> tuple[np.ndarray, float]:
+        """Centre snapped onto the lethal cells within snap_radius of around, and the clearest radius there."""
+        centre = geo.snap_centre(grid, around, self.snap_radius)
+        radius = geo.choose_radius(grid, centre, self.circle_radius, self.circle_radius_tol, spacing=self.check_spacing)
+        return centre, radius
+
+    def _replace_circle(self, label: str, centre) -> tuple[np.ndarray, float]:
+        """Places the circle again around its centre, on a snapshot from the end of the approach."""
+        new_centre, radius = self._place_circle(self._snapshot(), centre)
+        self.get_logger().info(f"{label}: centre moved {np.linalg.norm(new_centre - centre):.2f} m to "
+                               f"({new_centre[0]:.1f}, {new_centre[1]:.1f}), R {radius:.2f} m")
+        return new_centre, radius
 
     def _approach(self, goal_handle, label: str, centre, radius, clockwise: bool) -> bool:
         def pick(grid, failed):
@@ -266,6 +294,7 @@ class SafePassageNode(Node):
         last = None
         for attempt in range(1, attempts + 1):
             self._check_cancel(goal_handle)
+            self._wait_while_zone(goal_handle, label)
             picked = pick(self._snapshot(), failed)
             if picked is not None:
                 last, yaw = picked
@@ -326,6 +355,26 @@ class SafePassageNode(Node):
     def _check_cancel(self, goal_handle):
         if goal_handle.is_cancel_requested:
             raise Canceled()
+
+    def _wait_while_zone(self, goal_handle, before: str):
+        """Hold while any keep-out zone is active; raises Canceled. No timeout: the caller's ends it."""
+        if not self._zone_active:
+            return
+        self.get_logger().warning(f"Keep-out zone active, holding before {before}")
+        event = threading.Event()
+        while self._zone_active:
+            self._check_cancel(goal_handle)
+            event.wait(POLL_S)
+        self._wait_for_costmap_since(goal_handle, self.get_clock().now() + Duration(seconds=self.zone_clear_settle))
+        self.get_logger().info(f"Keep-out zone cleared, carrying on with {before}")
+
+    def _wait_for_costmap_since(self, goal_handle, since: RosTime):
+        """Waits for a costmap stamped at or after since, so the next snapshot no longer has the zone."""
+        def fresh():
+            msg = self._costmap
+            return msg is not None and RosTime.from_msg(msg.header.stamp) >= since
+        if not self._wait(goal_handle, fresh, self.zone_clear_settle + 2.0):
+            self.get_logger().warning(f"No costmap on {self.costmap_topic} since the zone cleared; using the last one")
 
     def _wait(self, goal_handle, done: Callable[[], bool], timeout: float) -> bool:
         """Poll done until it holds or timeout passes; raises Canceled. Never spins: the executor runs callbacks."""
@@ -427,6 +476,12 @@ class SafePassageNode(Node):
 
     def _on_costmap(self, msg: OccupancyGrid):
         self._costmap = msg
+
+    def _on_keepout_mask(self, msg: OccupancyGrid):
+        active = bool(np.any(np.asarray(msg.data, dtype=np.int8) >= 100))
+        if active != self._zone_active:
+            self.get_logger().info(f"Keep-out zone {'active' if active else 'cleared'}")
+        self._zone_active = active
 
     def _snapshot(self) -> geo.CostGrid:
         msg = self._costmap

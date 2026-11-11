@@ -15,6 +15,8 @@ safe_passage_node:
     from_ll_service: "/asv5/fromLL"
     convert_to_controls_pose_service: "/asv5/convert_to_controls_pose"
     service_timeout: 2.0
+    # RobotX Task 4: hold while any keep-out zone is active (bb_localization keepout_zones.py)
+    keepout_mask_topic: "/asv5/keepout_mask"
 
     # Circles: R picked from circle_radius +- circle_radius_tol, centre snapped onto lidar-seen lethal cells
     circle_radius: 2.5

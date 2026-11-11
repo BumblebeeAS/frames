@@ -1,9 +1,11 @@
 #include "nodes/ReplanTrackerROS2Wrapper.h"
+#include "nodes/goal_sampling.h"
 #include "nodes/path_headings.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <tf2/LinearMath/Quaternion.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
@@ -33,6 +35,10 @@ ReplanTrackerROS2Wrapper::ReplanTrackerROS2Wrapper(const std::string& name) : No
     send_timeout_               = this->declare_parameter("send_timeout", 2.0);
     stop_timeout_               = this->declare_parameter("stop_timeout", 3.0);
     tf_failure_limit_           = this->declare_parameter("tf_failure_limit", 10);
+    costmap_topic_              = this->declare_parameter("costmap_topic", "global_costmap/costmap");
+    sample_spacing_             = this->declare_parameter("sample_spacing", 0.25);
+    sample_cost_threshold_      = this->declare_parameter("sample_cost_threshold", 17);
+    costmap_max_age_            = this->declare_parameter("costmap_max_age", 2.0);
 
     const bool click_goal_enable       = this->declare_parameter("click_goal_enable", false);
     const std::string click_goal_topic = this->declare_parameter("click_goal_topic", "click_goal");
@@ -116,6 +122,7 @@ rclcpp_action::GoalResponse ReplanTrackerROS2Wrapper::handle_goal(const rclcpp_a
                 && std::isfinite(goal->goal_ll.longitude) && std::abs(goal->goal_ll.longitude) <= 180.0
                 && std::isfinite(goal->goal_heading);
     }
+    valid = valid && std::isfinite(goal->sample_radius) && goal->sample_radius >= 0.0f;
     if (!valid) {
         RCLCPP_ERROR(this->get_logger(), "Rejected invalid TrackPath goal (goal_type %u)", goal->goal_type);
         return rclcpp_action::GoalResponse::REJECT;
@@ -264,6 +271,7 @@ void ReplanTrackerROS2Wrapper::start_goal(const std::shared_ptr<GoalHandleTrackP
     route_global_to_odom_.reset();
     clear_cycle();
     clear_validity();
+    stop_sampling();
 
     const auto goal = goal_handle->get_goal();
     if (goal->goal_type == TrackPath::Goal::GOAL_LL) {
@@ -271,10 +279,12 @@ void ReplanTrackerROS2Wrapper::start_goal(const std::shared_ptr<GoalHandleTrackP
         RCLCPP_INFO(this->get_logger(), "Starting TrackPath goal (LL %.7f, %.7f, heading %.1f deg)",
                     goal->goal_ll.latitude, goal->goal_ll.longitude, goal->goal_heading * 180.0 / M_PI);
     } else {
-        goal_pose_ = goal->goal_pose;
+        goal_pose_    = goal->goal_pose;
+        nominal_goal_ = goal->goal_pose;
         RCLCPP_INFO(this->get_logger(), "Starting TrackPath goal (pose in %s)",
                     goal->goal_pose.header.frame_id.c_str());
     }
+    start_sampling(*goal);
     state_ = State::TRACKING;
     request_replan("first send");
 }
@@ -291,6 +301,7 @@ void ReplanTrackerROS2Wrapper::terminate(uint8_t status) {
     }
     active_.reset();
     goal_pose_.reset();
+    stop_sampling();
     clear_cycle();
     clear_validity();
     route_.clear();
@@ -382,6 +393,12 @@ void ReplanTrackerROS2Wrapper::run_checks(const PoseStamped& pose) {
         }
     }
 
+    if (sample_radius_ > 0.0 && target_blocked()) {
+        RCLCPP_WARN(this->get_logger(), "Goal blocked on the costmap, replanning");
+        request_replan("goal blocked");
+        return;
+    }
+
     // The service only says whether a path is blocked, not where, so the near part is checked on its own
     if (!is_path_valid_client_->service_is_ready()) return;
     size_t split = route_cursor_;
@@ -455,6 +472,94 @@ std::optional<tf2::Transform> ReplanTrackerROS2Wrapper::lookup_global_to_odom() 
     }
 }
 
+// Goal sampling
+
+// Only goals in the global frame: candidates are judged on the global costmap, which shares it
+void ReplanTrackerROS2Wrapper::start_sampling(const TrackPath::Goal& goal) {
+    if (!(goal.sample_radius > 0.0f)) return;
+    if (costmap_topic_.empty()) {
+        RCLCPP_WARN(this->get_logger(), "sample_radius ignored: costmap_topic is empty");
+        return;
+    }
+    if (goal.goal_type == TrackPath::Goal::GOAL_POSE && goal.goal_pose.header.frame_id != global_frame_id_) {
+        RCLCPP_WARN(this->get_logger(), "sample_radius ignored: goal in %s, sampling needs %s",
+                    goal.goal_pose.header.frame_id.c_str(), global_frame_id_.c_str());
+        return;
+    }
+    sample_radius_  = goal.sample_radius;
+    sampling_since_ = now_s();
+
+    // Same group as tick, so costmap_ needs no lock
+    rclcpp::SubscriptionOptions options;
+    options.callback_group = server_cb_group_;
+    costmap_sub_           = this->create_subscription<OccupancyGrid>(
+        costmap_topic_, rclcpp::QoS(1).transient_local().reliable(),
+        [this](OccupancyGrid::ConstSharedPtr msg) { costmap_ = std::move(msg); }, options);
+    RCLCPP_INFO(this->get_logger(), "Sampling within %.2f m of the goal on %s", sample_radius_,
+                costmap_sub_->get_topic_name());
+}
+
+void ReplanTrackerROS2Wrapper::stop_sampling() {
+    sample_radius_ = 0.0;
+    nominal_goal_.reset();
+    tried_.clear();
+    costmap_sub_.reset();
+    costmap_.reset();
+}
+
+// The latched grid can be from whenever nav2 last had a subscriber, hence the age check
+const ReplanTrackerROS2Wrapper::OccupancyGrid* ReplanTrackerROS2Wrapper::fresh_costmap() {
+    if (!costmap_) return nullptr;
+    if (costmap_->header.frame_id != global_frame_id_) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Costmap in %s, not %s: ignored",
+                             costmap_->header.frame_id.c_str(), global_frame_id_.c_str());
+        return nullptr;
+    }
+    const rclcpp::Time stamp(costmap_->header.stamp, this->get_clock()->get_clock_type());
+    if ((this->get_clock()->now() - stamp).seconds() > costmap_max_age_) return nullptr;
+    return costmap_.get();
+}
+
+bool ReplanTrackerROS2Wrapper::target_blocked() {
+    const auto* grid = fresh_costmap();
+    if (!grid || !goal_pose_) return false;
+    const auto& target = goal_pose_->pose.position;
+    return !goal_sampling::is_free(*grid, target.x, target.y, sample_cost_threshold_);
+}
+
+// Keeps a usable target, else moves it to the nearest usable point around the nominal goal with its heading.
+// False when there is none, after counting it as a planning failure.
+bool ReplanTrackerROS2Wrapper::choose_target() {
+    const auto* grid = fresh_costmap();
+    if (!grid || !nominal_goal_) {
+        if (now_s() - sampling_since_ > costmap_max_age_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                                 "No fresh costmap on %s, planning to the target as is", costmap_topic_.c_str());
+        }
+        return true;
+    }
+    const double tried_radius = sample_spacing_ / 2.0;
+    const auto& target        = goal_pose_->pose.position;
+    if (goal_sampling::usable(*grid, target.x, target.y, sample_cost_threshold_, tried_, tried_radius)) return true;
+
+    const auto& nominal = nominal_goal_->pose.position;
+    const auto pose     = get_current_pose();
+    const auto pick = goal_sampling::choose(*grid, nominal, sample_radius_, sample_spacing_, sample_cost_threshold_,
+                                            pose ? pose->pose.position : nominal, tried_, tried_radius);
+    if (!pick) {
+        char reason[64];
+        std::snprintf(reason, sizeof(reason), "no free goal within %.2f m", sample_radius_);
+        on_plan_failed(reason);
+        return false;
+    }
+    goal_pose_->pose.position.x  = pick->x;
+    goal_pose_->pose.position.y  = pick->y;
+    goal_pose_->pose.orientation = nominal_goal_->pose.orientation;
+    RCLCPP_INFO(this->get_logger(), "Goal blocked, target %.2f m from the goal at (%.2f, %.2f)",
+                planar_distance(nominal, *pick), pick->x, pick->y);
+    return true;
+}
+
 // Replan
 
 void ReplanTrackerROS2Wrapper::request_plan() {
@@ -463,6 +568,7 @@ void ReplanTrackerROS2Wrapper::request_plan() {
         on_plan_failed("planner server unavailable");
         return;
     }
+    if (sample_radius_ > 0.0 && !choose_target()) return;
     ComputePathToPose::Goal goal;
     goal.goal           = *goal_pose_;
     goal.use_start      = false;  // Use current robot pose
@@ -502,6 +608,7 @@ void ReplanTrackerROS2Wrapper::poll_resolve() {
     q.setRPY(0.0, 0.0, active_->get_goal()->goal_heading);
     pose.pose.orientation = tf2::toMsg(q);
     goal_pose_            = pose;
+    nominal_goal_         = pose;
     RCLCPP_INFO(this->get_logger(), "LL goal resolved to (%.2f, %.2f) in %s", point.x, point.y,
                 global_frame_id_.c_str());
     request_plan();
@@ -539,6 +646,14 @@ void ReplanTrackerROS2Wrapper::poll_plan() {
 
     auto wrapped = plan_result_future_.get();
     if (wrapped.code != rclcpp_action::ResultCode::SUCCEEDED || !wrapped.result || wrapped.result->path.poses.empty()) {
+        // A target the planner cannot reach is not tried again. UNKNOWN may be an occupied start instead, so it only
+        // counts without a costmap; with one, choose_target moves off a blocked target by itself
+        const uint16_t error = wrapped.result ? wrapped.result->error_code : 0;
+        if (sample_radius_ > 0.0
+            && (error == ComputePathToPose::Result::GOAL_OCCUPIED || error == ComputePathToPose::Result::NO_VALID_PATH
+                || (error == ComputePathToPose::Result::UNKNOWN && !fresh_costmap()))) {
+            tried_.push_back(goal_pose_->pose.position);
+        }
         on_plan_failed(wrapped.result && !wrapped.result->error_msg.empty() ? wrapped.result->error_msg.c_str()
                                                                             : "no path");
         return;
@@ -682,6 +797,7 @@ void ReplanTrackerROS2Wrapper::poll_conversion(const PoseStamped& pose) {
     replan_needed_   = false;
     holding_         = false;
     next_check_time_ = now_s() + check_period_;
+    tried_.clear();
     clear_validity();  // a pending check was for the old route
 }
 

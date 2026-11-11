@@ -17,6 +17,12 @@ replan_tracker_node:
     stop_timeout: 3.0
     tf_failure_limit: 10
 
+    # Goal sampling, for goals with sample_radius > 0 in global_frame_id
+    costmap_topic: "/asv5/global_costmap/costmap"  # subscribed only while such a goal runs
+    sample_spacing: 0.25  # m between rings and along them
+    sample_cost_threshold: 17  # grid value (0..100); 17 keeps the hull's circumscribed radius clear at the current inflation
+    costmap_max_age: 2.0  # s
+
     click_goal_enable: true
     click_goal_topic: "/asv5/track_path/click_goal"
     click_goal_2d: true

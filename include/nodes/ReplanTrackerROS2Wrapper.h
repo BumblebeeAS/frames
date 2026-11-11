@@ -12,6 +12,7 @@
 #include <memory>
 #include <nav2_msgs/action/compute_path_to_pose.hpp>
 #include <nav2_msgs/srv/is_path_valid.hpp>
+#include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <optional>
 #include <rclcpp/rclcpp.hpp>
@@ -34,6 +35,7 @@ public:
     using GetPose             = bb_planner_msgs::srv::GetPoseToControlsFrame;
     using FromLL              = robot_localization::srv::FromLL;
     using PoseStamped         = geometry_msgs::msg::PoseStamped;
+    using OccupancyGrid       = nav_msgs::msg::OccupancyGrid;
 
     explicit ReplanTrackerROS2Wrapper(const std::string& name);
 
@@ -77,6 +79,10 @@ private:
     double send_timeout_;
     double stop_timeout_;
     int tf_failure_limit_;
+    std::string costmap_topic_;
+    double sample_spacing_;
+    int sample_cost_threshold_;
+    double costmap_max_age_;
     bool click_goal_2d_;
     bool click_goal_specified_heading_;
     std::string global_frame_id_;
@@ -88,6 +94,14 @@ private:
     std::shared_ptr<GoalHandleTrackPath> active_;
     std::shared_ptr<GoalHandleTrackPath> pending_;
     std::optional<PoseStamped> goal_pose_;  // empty until an LL goal is resolved
+
+    // Goal sampling: goal_pose_ is the target planned to, nominal_goal_ the goal as given; both in the global frame
+    double sample_radius_ = 0.0;  // 0 when off for this goal
+    std::optional<PoseStamped> nominal_goal_;
+    std::vector<geometry_msgs::msg::Point> tried_;  // targets the planner rejected since the last send
+    rclcpp::Subscription<OccupancyGrid>::SharedPtr costmap_sub_;  // only while a sampling goal is active
+    OccupancyGrid::ConstSharedPtr costmap_;
+    double sampling_since_ = 0.0;  // steady s, the first grid takes a moment to arrive
     int plan_failures_         = 0;
     int tf_failures_           = 0;
     double next_check_time_    = 0.0;
@@ -164,6 +178,13 @@ private:
     void request_replan(const char* reason);
     void hold();
     std::optional<tf2::Transform> lookup_global_to_odom() const;
+
+    // Goal sampling
+    void start_sampling(const TrackPath::Goal& goal);
+    void stop_sampling();
+    const OccupancyGrid* fresh_costmap();
+    bool target_blocked();
+    bool choose_target();
 
     // Replan
     void request_plan();

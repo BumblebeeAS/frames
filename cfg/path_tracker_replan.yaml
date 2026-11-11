@@ -23,6 +23,10 @@ replan_tracker_node:
     sample_cost_threshold: 17  # grid value (0..100); 17 keeps the hull's circumscribed radius clear at the current inflation
     costmap_max_age: 2.0  # s
 
+    # RobotX Task 4: hold a goal inside a keep-out zone until it clears (bb_localization keepout_zones.py)
+    keepout_mask_topic: "/asv5/keepout_mask"
+    zone_clear_settle: 1.0  # s before replanning once the zone clears; the global costmap updates at 2 Hz
+
     click_goal_enable: true
     click_goal_topic: "/asv5/track_path/click_goal"
     click_goal_2d: true

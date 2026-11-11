@@ -35,6 +35,12 @@ inline std::optional<int8_t> value_at(const Grid& grid, double x, double y) {
     return grid.data[index];
 }
 
+// Inside a zone of a nav2 KeepoutFilter mask (100 in a zone)
+inline bool in_keepout(const Grid& mask, double x, double y) {
+    const auto value = value_at(mask, x, y);
+    return value && *value >= 100;
+}
+
 // Inside the grid and unknown or at most threshold
 inline bool is_free(const Grid& grid, double x, double y, int threshold) {
     const auto value = value_at(grid, x, y);

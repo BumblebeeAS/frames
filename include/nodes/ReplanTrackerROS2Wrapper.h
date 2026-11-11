@@ -24,6 +24,8 @@
 // Sends the whole simplified path to controls and leaves it running until a check fails: the route ahead is
 // blocked, the robot is off the route, or a map to odom correction moved it. Then it replans from the current
 // pose and sends again. A replan is plan, simplify, convert, drop waypoints passed meanwhile, send.
+// A goal inside a keep-out zone (RobotX Task 4) is held: no plans, no failures counted, no progress timeout, until the
+// zone clears; the caller decides when to give up.
 // All goal state is owned by tick(); server callbacks share its mutually exclusive group and only queue.
 class ReplanTrackerROS2Wrapper : public rclcpp::Node {
 public:
@@ -83,6 +85,8 @@ private:
     double sample_spacing_;
     int sample_cost_threshold_;
     double costmap_max_age_;
+    std::string keepout_mask_topic_;
+    double zone_clear_settle_;
     bool click_goal_2d_;
     bool click_goal_specified_heading_;
     std::string global_frame_id_;
@@ -102,6 +106,12 @@ private:
     rclcpp::Subscription<OccupancyGrid>::SharedPtr costmap_sub_;  // only while a sampling goal is active
     OccupancyGrid::ConstSharedPtr costmap_;
     double sampling_since_ = 0.0;  // steady s, the first grid takes a moment to arrive
+
+    // Keep-out zones: the KeepoutFilter mask, in the global frame; same group as tick, so no lock
+    rclcpp::Subscription<OccupancyGrid>::SharedPtr keepout_sub_;
+    OccupancyGrid::ConstSharedPtr keepout_mask_;
+    bool zone_held_ = false;  // goal inside a zone, holding until it clears
+
     int plan_failures_         = 0;
     int tf_failures_           = 0;
     double next_check_time_    = 0.0;
@@ -185,6 +195,11 @@ private:
     const OccupancyGrid* fresh_costmap();
     bool target_blocked();
     bool choose_target();
+
+    // Keep-out zones
+    bool goal_in_zone();
+    void enter_zone_hold();
+    void exit_zone_hold();
 
     // Replan
     void request_plan();

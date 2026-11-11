@@ -120,3 +120,15 @@ TEST(GoalSampling, OutsideGridIsNotChosen) {
     EXPECT_LT(p->x, 10.0);
     EXPECT_GE(std::hypot(p->x - 9.9, p->y), 1.0 - 1e-9);
 }
+
+TEST(GoalSampling, InKeepoutOnlyInsideAZone) {
+    auto mask = grid();
+    fill(mask, 2.0, 0.0, 1.0, 100);
+    EXPECT_TRUE(goal_sampling::in_keepout(mask, 2.0, 0.0));
+    EXPECT_TRUE(goal_sampling::in_keepout(mask, 2.9, 0.0));
+    EXPECT_FALSE(goal_sampling::in_keepout(mask, 3.2, 0.0));   // just outside
+    EXPECT_FALSE(goal_sampling::in_keepout(mask, 0.0, 0.0));   // free
+    EXPECT_FALSE(goal_sampling::in_keepout(mask, 50.0, 0.0));  // off the mask
+    fill(mask, -5.0, 0.0, 1.0, 99);
+    EXPECT_FALSE(goal_sampling::in_keepout(mask, -5.0, 0.0));  // high cost is not a zone
+}

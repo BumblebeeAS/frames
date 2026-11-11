@@ -39,6 +39,8 @@ ReplanTrackerROS2Wrapper::ReplanTrackerROS2Wrapper(const std::string& name) : No
     sample_spacing_             = this->declare_parameter("sample_spacing", 0.25);
     sample_cost_threshold_      = this->declare_parameter("sample_cost_threshold", 17);
     costmap_max_age_            = this->declare_parameter("costmap_max_age", 2.0);
+    keepout_mask_topic_         = this->declare_parameter("keepout_mask_topic", "");
+    zone_clear_settle_          = this->declare_parameter("zone_clear_settle", 1.0);
 
     const bool click_goal_enable       = this->declare_parameter("click_goal_enable", false);
     const std::string click_goal_topic = this->declare_parameter("click_goal_topic", "click_goal");
@@ -101,6 +103,16 @@ ReplanTrackerROS2Wrapper::ReplanTrackerROS2Wrapper(const std::string& name) : No
             click_goal_topic, 1, std::bind(&ReplanTrackerROS2Wrapper::on_click_goal, this, _1), click_options);
         RCLCPP_INFO(this->get_logger(), "Accepting click goals on %s (%s)", click_goal_sub_->get_topic_name(),
                     click_goal_2d_ ? "2D" : "3D");
+    }
+
+    // Latched by the keep-out node; empty topic disables the zone hold
+    if (!keepout_mask_topic_.empty()) {
+        rclcpp::SubscriptionOptions keepout_options;
+        keepout_options.callback_group = server_cb_group_;
+        keepout_sub_                   = this->create_subscription<OccupancyGrid>(
+            keepout_mask_topic_, rclcpp::QoS(1).transient_local().reliable(),
+            [this](OccupancyGrid::ConstSharedPtr msg) { keepout_mask_ = std::move(msg); }, keepout_options);
+        RCLCPP_INFO(this->get_logger(), "Holding goals inside keep-out zones on %s", keepout_sub_->get_topic_name());
     }
 
     tick_timer_ = this->create_wall_timer(std::chrono::duration<double>(1.0 / tick_rate_),
@@ -212,6 +224,17 @@ void ReplanTrackerROS2Wrapper::tick() {
         return;
     }
 
+    // Before the pose and progress checks, so neither can abort a held goal
+    if (!zone_held_ && goal_in_zone()) enter_zone_hold();
+    if (zone_held_) {
+        if (goal_in_zone()) {
+            poll_locomotion();  // cancels a send accepted after the hold; results are ignored
+            progress_anchor_time_ = -1.0;
+            return;
+        }
+        exit_zone_hold();
+    }
+
     auto pose = get_current_pose();
     if (!pose) {
         if (++tf_failures_ >= tf_failure_limit_) {
@@ -266,6 +289,7 @@ void ReplanTrackerROS2Wrapper::start_goal(const std::shared_ptr<GoalHandleTrackP
     holding_              = false;
     progress_anchor_time_ = -1.0;
     loco_owned_           = false;
+    zone_held_            = false;
     route_.clear();
     route_s_.clear();
     route_global_to_odom_.reset();
@@ -283,6 +307,10 @@ void ReplanTrackerROS2Wrapper::start_goal(const std::shared_ptr<GoalHandleTrackP
         nominal_goal_ = goal->goal_pose;
         RCLCPP_INFO(this->get_logger(), "Starting TrackPath goal (pose in %s)",
                     goal->goal_pose.header.frame_id.c_str());
+        if (keepout_sub_ && goal->goal_pose.header.frame_id != global_frame_id_) {
+            RCLCPP_WARN(this->get_logger(), "Keep-out check skipped: goal in %s, the mask is in %s",
+                        goal->goal_pose.header.frame_id.c_str(), global_frame_id_.c_str());
+        }
     }
     start_sampling(*goal);
     state_ = State::TRACKING;
@@ -307,6 +335,7 @@ void ReplanTrackerROS2Wrapper::terminate(uint8_t status) {
     route_.clear();
     replan_needed_ = false;
     holding_       = false;
+    zone_held_     = false;
     state_         = State::IDLE;
 }
 
@@ -560,9 +589,48 @@ bool ReplanTrackerROS2Wrapper::choose_target() {
     return true;
 }
 
+// Keep-out zones
+
+// The goal as given, not a sampled target; only in the global frame, the mask's. False until an LL goal is resolved.
+bool ReplanTrackerROS2Wrapper::goal_in_zone() {
+    if (!keepout_mask_ || !nominal_goal_) return false;
+    if (keepout_mask_->header.frame_id != global_frame_id_) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Keep-out mask in %s, not %s: ignored",
+                             keepout_mask_->header.frame_id.c_str(), global_frame_id_.c_str());
+        return false;
+    }
+    if (nominal_goal_->header.frame_id != global_frame_id_) return false;
+    const auto& goal = nominal_goal_->pose.position;
+    return goal_sampling::in_keepout(*keepout_mask_, goal.x, goal.y);
+}
+
+// Drops a plan or conversion in flight, so nothing is sent towards the zone, and stops the running trajectory
+void ReplanTrackerROS2Wrapper::enter_zone_hold() {
+    RCLCPP_WARN(this->get_logger(), "Goal inside a keep-out zone, holding until it clears");
+    zone_held_ = true;
+    clear_cycle();
+    clear_validity();
+    hold();
+    replan_needed_ = false;
+}
+
+void ReplanTrackerROS2Wrapper::exit_zone_hold() {
+    RCLCPP_INFO(this->get_logger(), "Keep-out zone cleared off the goal, replanning");
+    zone_held_            = false;
+    plan_failures_        = 0;
+    progress_anchor_time_ = -1.0;
+    next_replan_time_     = now_s() + zone_clear_settle_;  // lets the costmaps drop the zone before planning
+    request_replan("zone cleared");
+}
+
 // Replan
 
 void ReplanTrackerROS2Wrapper::request_plan() {
+    // An LL goal resolves and plans in the same tick, after the hold check
+    if (goal_in_zone()) {
+        enter_zone_hold();
+        return;
+    }
     next_replan_time_ = now_s() + check_period_;  // retry pace after a failure
     if (!nav2_action_client_->action_server_is_ready()) {
         on_plan_failed("planner server unavailable");

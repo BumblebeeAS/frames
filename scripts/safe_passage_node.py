@@ -466,11 +466,7 @@ class SafePassageNode(Node):
         for k in range(len(points)):
             for retry in range(1 + max(0, int(self.point_retries))):
                 if k > 0 or retry > 0:
-                    fresh, held = self._estimate(buoy), buoy.estimate
-                    if (fresh.source == ba.PREDICTED and held.source == ba.BLOB
-                            and np.linalg.norm(fresh.predicted - held.xy) <= fresh.radius):
-                        fresh = held  # this costmap misses the blob we are circling: it has not moved
-                    estimate = fresh
+                    estimate = self._estimate(buoy)
                     moved = float(np.linalg.norm(estimate.xy - centre))
                     if may_restart and moved > self.estimate_restart_threshold:
                         # Points driven so far were around the wrong place: the rest would not enclose the buoy
@@ -503,9 +499,15 @@ class SafePassageNode(Node):
         return True
 
     def _estimate(self, buoy: Buoy) -> ba.Estimate:
+        """Where the buoy is now. A costmap that misses the blob it was last seen as does not move it."""
         with self._lock:
             claimed = [b.estimate.xy for b in self._buoys if b.status == "circled" and b.estimate is not None]
-            return self._aligner.estimate(buoy.index, claimed)
+            fresh = self._aligner.estimate(buoy.index, claimed)
+        held = buoy.estimate
+        if (fresh.source == ba.PREDICTED and held is not None and held.source == ba.BLOB
+                and np.linalg.norm(fresh.predicted - held.xy) <= fresh.radius):
+            return held
+        return fresh
 
     def _neighbours(self, buoy: Buoy) -> list:
         """Every other buoy where we best know it: the centre it was circled around, else its predicted position."""

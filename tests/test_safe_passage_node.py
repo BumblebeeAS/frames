@@ -680,3 +680,24 @@ def test_same_costmap_counts_once_towards_the_lock(node):
         node._align_step(costmap(LAYOUT + SHIFT))
     assert node._aligner.locked
     node._aligner = None
+
+
+def test_restart_after_an_incident_keeps_the_blob_a_costmap_misses(node):
+    """The buoy restarts on a costmap that lacks its blob for a moment: it is still circled where it was seen."""
+    truth = np.array([10.7, 0.0])
+    grid = costmap([truth])
+    h = Harness(node, [buoy("flashing_red", [10.0, 0.0])], boat=(0.0, 0.0), respond=True)
+    node._snapshot = lambda: grid
+
+    def request_and_lose_the_blob():
+        node._on_assistance(assistance(xy=[30.0, 12.0]))
+        node._aligner.buoy_blobs = np.zeros((0, 2))
+        return True
+
+    h.results = [True, True, request_and_lose_the_blob]
+    later(0.2, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 1 and "BLOB" in message
+    per = node.circle_points + node.circle_overshoot_points + 1
+    radii = np.linalg.norm(np.array(h.targets[-per:]) - truth, axis=1)
+    assert radii.max() - radii.min() < 0.15, radii              # the whole restarted circle is around the blob

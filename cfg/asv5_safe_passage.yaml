@@ -5,7 +5,6 @@ safe_passage_node:
   ros__parameters:
     action_name: "/asv5/safe_passage"
     costmap_topic: "/asv5/global_costmap/costmap"
-    incident_topic: "/asv5/task4/incident_active"  # latched Bool from the Task 4 handler
     marker_topic: "/asv5/safe_passage/markers"
     global_frame_id: "asv5/map"
     base_link_frame_id: "asv5/base_link"
@@ -62,6 +61,21 @@ safe_passage_node:
     buoy_attempts: 2
     requeue_failed: true           # failed reds and greens get one more attempt before the exit
 
-    # Task 4 (goal pause_on_incident)
-    preempt_grace: 1.0             # after a goal fails, wait this long for the incident flag before counting it
-    resume_settle: 1.0             # wait after the flag clears, then redo the current buoy
+    # Task 4 Core (goal respond_to_assistance): an AssistanceRequest for this vehicle type interrupts the goal.
+    # IncidentAck + SetTask go out, the boat drives to the position, sends the ReadinessReport, holds for the
+    # ReadinessConfirm naming that report, then SetTask back and the interrupted buoy starts over.
+    vehicle_id: "USV1"             # as the OCS names this vehicle: ReadinessConfirms for another id are ignored
+    vehicle_type: "usv"            # AssistanceRequests for another type are ignored
+    assistance_topic: "/asv5/task4/assistance_request"        # from the OCS bridge, not latched
+    readiness_confirm_topic: "/asv5/task4/readiness_confirm"  # from the OCS bridge, not latched
+    incident_ack_action: "/asv5/report/incident_ack"
+    readiness_action: "/asv5/report/readiness"
+    set_task_action: "/asv5/set_task"
+    incident_task: "dynamic_incident"   # heartbeat task while answering
+    resume_task: "safe_passage"         # and after
+    incident_sample_radius: 0.5    # the tracker may move a blocked station this far
+    incident_tolerance: 1.0        # on station within this of the requested position
+    incident_goal_retries: 2       # more tries at reaching it; unreached: no ReadinessReport, back to the buoys
+    readiness_confirm_timeout: 900.0   # hold this long for the ReadinessConfirm, then resume anyway
+    report_retries: 3              # more tries for IncidentAck, SetTask and ReadinessReport
+    report_timeout: 40.0           # per try; the bridge gives the OCS 30 s

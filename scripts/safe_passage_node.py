@@ -19,9 +19,11 @@ Retries: a failed point is re-placed and tried again point_retries times, then s
 row, or a start point that cannot be reached, fails the attempt. A buoy gets buoy_attempts attempts. Failed reds and
 greens are tried once more before the exit. A buoy that still fails is logged and skipped.
 
-Task 4: with pause_on_incident, a set incident flag cancels the current goal and holds; once it clears, the current
-buoy starts over from TRANSIT. A goal that fails without us canceling waits preempt_grace for the flag, since the
-incident handler may preempt us before its flag arrives.
+Task 4 Core: with respond_to_assistance, an AssistanceRequest for this vehicle type interrupts whatever the goal is
+doing. The node sends the IncidentAck and switches the heartbeat task, drives to the requested position, sends the
+ReadinessReport once there, and holds (the boat station-keeps without a goal) until the ReadinessConfirm naming that
+report arrives or readiness_confirm_timeout passes. Then it switches the task back and the interrupted buoy starts
+over from TRANSIT. Requests are taken once per seq, only while a goal runs; a newer request replaces the one in hand.
 
 Conventions: everything is planned in global_frame_id (asv5/map, ENU). TrackPath goals are GOAL_POSE there with
 specified_heading false and the heading along the circle, so the boat ends each point facing the next.
@@ -37,7 +39,8 @@ import numpy as np
 import rclpy
 import tf2_ros
 from bb_controls_msgs.action import TrackPath
-from bb_robotx_msgs.action import SafePassage
+from bb_robotx_msgs.action import SafePassage, SendIncidentAck, SendReadinessReport, SetTask
+from bb_robotx_msgs.msg import AssistanceRequest, ReadinessConfirm
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import Point, PoseStamped
 from nav_msgs.msg import OccupancyGrid
@@ -49,16 +52,21 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time as RosTime
 from robot_localization.srv import FromLL
-from std_msgs.msg import Bool, ColorRGBA
+from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
 from frames.utils import buoy_align as ba
 from frames.utils import safe_passage_geometry as geo
 
-# nav2 costmaps publish reliable transient local; the incident flag is latched the same way
+# nav2 costmaps publish reliable transient local
 LATCHED_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST, depth=1,
     reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+)
+# Task 4 Core commands: the bridge does not latch them (an old request must not move a relaunched node)
+COMMAND_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST, depth=10,
+    reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE,
 )
 POLL_S = 0.05
 MARKER_PERIOD_S = 0.5
@@ -73,8 +81,22 @@ class Canceled(Exception):
     """The SafePassage goal was canceled."""
 
 
-class Paused(Exception):
-    """The Task 4 incident flag is set: stop driving and hold."""
+class Assistance(Exception):
+    """An AssistanceRequest is waiting: drop what is being driven and answer it."""
+
+
+@dataclass
+class Incident:
+    """One Task 4 Core AssistanceRequest and how far its answer got."""
+    seq: int                            # RxCommand seq, quoted by the IncidentAck and the ReadinessReport
+    latitude: float
+    longitude: float
+    received: float                     # monotonic
+    state: str = "received"             # received | transit | on_station | then how it ended:
+    #                                     confirmed | confirm_timeout | unreachable | report_failed | no_position |
+    #                                     superseded | canceled
+    report_seq: Optional[int] = None    # seq of the report that carried our ReadinessReport
+    ended: Optional[float] = None
 
 
 @dataclass
@@ -96,7 +118,8 @@ class SafePassageNode(Node):
 
         # Wiring
         self.costmap_topic = param("costmap_topic", "/asv5/global_costmap/costmap")
-        self.incident_topic = param("incident_topic", "/asv5/task4/incident_active")
+        self.vehicle_id = param("vehicle_id", "USV1")      # as the OCS and RoboCommand name this vehicle
+        self.vehicle_type = param("vehicle_type", "usv")   # AssistanceRequests for other types are not ours
         self.global_frame_id = param("global_frame_id", "asv5/map")
         self.base_link_frame_id = param("base_link_frame_id", "asv5/base_link")
         self.service_timeout = param("service_timeout", 2.0)
@@ -131,9 +154,15 @@ class SafePassageNode(Node):
         self.buoy_attempts = param("buoy_attempts", 2)
         self.requeue_failed = param("requeue_failed", True)
 
-        # Task 4
-        self.preempt_grace = param("preempt_grace", 1.0)
-        self.resume_settle = param("resume_settle", 1.0)
+        # Task 4 Core
+        self.readiness_confirm_timeout = param("readiness_confirm_timeout", 900.0)
+        self.incident_goal_retries = param("incident_goal_retries", 2)
+        self.incident_sample_radius = param("incident_sample_radius", 0.5)
+        self.incident_tolerance = param("incident_tolerance", 1.0)
+        self.report_retries = param("report_retries", 3)
+        self.report_timeout = param("report_timeout", 40.0)   # the bridge gives the OCS 30 s
+        self.incident_task = param("incident_task", "dynamic_incident")
+        self.resume_task = param("resume_task", "safe_passage")
 
         if self.goal_sample_radius > 0.0 and self.goal_sample_radius < 0.25:
             self.get_logger().warning("goal_sample_radius under the tracker's sample_spacing (0.25 m) samples nothing")
@@ -146,9 +175,10 @@ class SafePassageNode(Node):
         self._grid: Optional[geo.CostGrid] = None
         self.create_subscription(OccupancyGrid, self.costmap_topic, self._on_costmap, LATCHED_QOS,
                                  callback_group=self.costmap_group)
-        self._incident = False
-        self.create_subscription(Bool, self.incident_topic, self._on_incident, LATCHED_QOS,
-                                 callback_group=self.cb_group)
+        self.create_subscription(AssistanceRequest, param("assistance_topic", "/asv5/task4/assistance_request"),
+                                 self._on_assistance, COMMAND_QOS, callback_group=self.cb_group)
+        self.create_subscription(ReadinessConfirm, param("readiness_confirm_topic", "/asv5/task4/readiness_confirm"),
+                                 self._on_confirm, COMMAND_QOS, callback_group=self.cb_group)
         self.marker_pub = self.create_publisher(MarkerArray, param("marker_topic", "/asv5/safe_passage/markers"), 1)
         self.create_timer(MARKER_PERIOD_S, self._publish_markers, callback_group=self.cb_group)
 
@@ -159,12 +189,24 @@ class SafePassageNode(Node):
         self._circle: list = []      # [(xy, yaw)] being driven, for markers
         self._target: Optional[np.ndarray] = None
         self._logged_t = np.zeros(2)
-        self._pause_enabled = False
+        # Task 4 Core, all under _lock. A request moves _pending -> _incident -> _incidents and never back.
+        self._respond = False                         # the running goal answers AssistanceRequests
+        self._seen: set[int] = set()                  # every request seq taken or turned down, for the node's life
+        self._pending: Optional[Incident] = None      # accepted, not yet picked up by the goal thread
+        self._incident: Optional[Incident] = None     # being answered
+        self._incidents: list[Incident] = []          # of the running goal, in order, for its result
+        self._confirms: dict[int, int] = {}           # report_seq -> ReadinessConfirm seq, for this vehicle
 
         self.track_path_name = param("track_path_action", "/asv5/track_path")
         self.track_path = ActionClient(self, TrackPath, self.track_path_name, callback_group=self.cb_group)
         self.from_ll = self.create_client(FromLL, param("from_ll_service", "/asv5/fromLL"),
                                           callback_group=self.cb_group)
+        self.incident_ack_name = param("incident_ack_action", "/asv5/report/incident_ack")
+        self.incident_ack = ActionClient(self, SendIncidentAck, self.incident_ack_name, callback_group=self.cb_group)
+        self.readiness_name = param("readiness_action", "/asv5/report/readiness")
+        self.readiness = ActionClient(self, SendReadinessReport, self.readiness_name, callback_group=self.cb_group)
+        self.set_task_name = param("set_task_action", "/asv5/set_task")
+        self.set_task = ActionClient(self, SetTask, self.set_task_name, callback_group=self.cb_group)
 
         self._busy = threading.Lock()
         self.server = ActionServer(
@@ -172,7 +214,8 @@ class SafePassageNode(Node):
             execute_callback=self._execute, goal_callback=self._on_goal,
             cancel_callback=lambda _: CancelResponse.ACCEPT, callback_group=self.cb_group,
         )
-        self.get_logger().info(f"Safe Passage ready: costmap {self.costmap_topic}, incidents on {self.incident_topic}")
+        self.get_logger().info(f"Safe Passage ready: costmap {self.costmap_topic}; answers Task 4 assistance requests "
+                               f"for {self.vehicle_type} as {self.vehicle_id} while a goal asks for it")
 
     # Goal handling
 
@@ -197,6 +240,11 @@ class SafePassageNode(Node):
             finally:
                 with self._lock:
                     self._aligner, self._buoys, self._circle, self._target = None, [], [], None
+                    self._respond = False
+                    for incident in (self._pending, self._incident):
+                        if incident is not None and incident.ended is None:
+                            self._end(incident, "canceled")
+                    self._pending = self._incident = None
             if summary is None:
                 result.success, result.message = False, "no buoy could be converted to the map frame"
                 goal_handle.abort()
@@ -208,7 +256,8 @@ class SafePassageNode(Node):
 
     def _run(self, goal_handle):
         request = goal_handle.request
-        self._pause_enabled = bool(request.pause_on_incident)
+        with self._lock:
+            self._respond, self._incidents, self._confirms = bool(request.respond_to_assistance), [], {}
         buoys = []
         for i, b in enumerate(request.buoys):
             xy = self._from_ll(b.position.latitude, b.position.longitude)
@@ -223,8 +272,13 @@ class SafePassageNode(Node):
             self._aligner, self._buoys, self._logged_t = aligner, buoys, np.zeros(2)
         self.get_logger().info(
             "Safe Passage buoys: " + ", ".join(f"{b.index}:{b.state}({b.xy[0]:.1f},{b.xy[1]:.1f})" for b in buoys)
-            + f"; tightest spacing {float(aligner.nn.min()):.2f} m; pause_on_incident {self._pause_enabled}")
-        self._align(goal_handle, len(buoys))
+            + f"; tightest spacing {float(aligner.nn.min()):.2f} m; respond_to_assistance {self._respond}")
+        while True:
+            try:
+                self._align(goal_handle, len(buoys))
+                break
+            except Assistance:
+                self._answer_assistance(goal_handle, len(buoys))
 
         # Ordered where the buoys are now believed to be: a shift of metres changes which is nearest
         boat = self._boat_xy()
@@ -247,6 +301,7 @@ class SafePassageNode(Node):
                     self._do_buoy(goal_handle, b, order.index(i), total)
         for i in exit_:
             self._do_buoy(goal_handle, buoys[i], order.index(i), total)
+        self._answer_assistance(goal_handle, total)  # a request that came in as the last buoy finished
 
         circled = [b for b in buoys if b.status == "circled"]
         failed = [b for b in buoys if b.status == "failed"]
@@ -257,7 +312,11 @@ class SafePassageNode(Node):
             detail = (f", {e.source} {np.linalg.norm(e.xy - b.xy):.2f} m from the drone, R {b.radius:.2f}"
                       if e is not None else "")
             lines.append(f"{i}:{b.state} {b.status} ({b.attempts} attempt(s){detail})")
-        return not failed, len(circled), len(failed), "; ".join(lines)
+        with self._lock:
+            incidents = [f"assistance request {x.seq} {x.state}"
+                         + (f" after {x.ended - x.received:.0f} s" if x.ended is not None else "")
+                         for x in self._incidents]
+        return not failed, len(circled), len(failed), "; ".join(lines + incidents)
 
     # Alignment
 
@@ -267,6 +326,7 @@ class SafePassageNode(Node):
         start = time.monotonic()
 
         def locked():
+            self._check(goal_handle)
             with self._lock:
                 matched, done = self._aligner.matched, self._aligner.locked
             goal_handle.publish_feedback(SafePassage.Feedback(phase="ALIGN", buoy_total=total, shift_inliers=matched))
@@ -325,9 +385,9 @@ class SafePassageNode(Node):
             label = f"Buoy {buoy.index} ({buoy.state}) attempt {buoy.attempts}/{self.buoy_attempts}"
             try:
                 ok = self._attempt(goal_handle, buoy, label, position, total)
-            except Paused:
-                buoy.attempts -= 1  # an incident is not a failed attempt
-                self._hold(goal_handle, buoy, position, total)
+            except Assistance:
+                buoy.attempts -= 1  # an incident is not a failed attempt: the buoy starts over afterwards
+                self._answer_assistance(goal_handle, total)
                 continue
             if ok:
                 buoy.status = "circled"
@@ -412,8 +472,9 @@ class SafePassageNode(Node):
 
     # Driving
 
-    def _drive(self, goal_handle, xy, yaw: float, label: str) -> bool:
-        """TrackPath to xy, ending at yaw (ENU). Raises Paused or Canceled."""
+    def _drive(self, goal_handle, xy, yaw: float, label: str, sample_radius: Optional[float] = None,
+               tolerance: Optional[float] = None) -> bool:
+        """TrackPath to xy, ending at yaw (ENU). Raises Assistance or Canceled."""
         self._check(goal_handle)
         with self._lock:
             self._target = np.asarray(xy)
@@ -428,51 +489,189 @@ class SafePassageNode(Node):
         goal.anchor_frame_name = self.base_link_frame_id
         goal.last_goal_anchor_only = True
         goal.max_replans = int(self.max_replans)
-        goal.sample_radius = float(self.goal_sample_radius)
+        goal.sample_radius = float(self.goal_sample_radius if sample_radius is None else sample_radius)
         goal.specified_heading = False
         goal.ignore_depth = True
-        goal.forward_tolerance = goal.sidemove_tolerance = float(self.goal_tolerance)
+        goal.forward_tolerance = goal.sidemove_tolerance = float(self.goal_tolerance if tolerance is None
+                                                                 else tolerance)
         goal.heading_tolerance = math.pi  # heading unspecified
         goal.depth_tolerance = 1.0  # must stay positive, controls compares strictly
         goal.stabilize_duration = int(self.goal_stabilize)
         self.get_logger().info(f"{label}: TrackPath to ({xy[0]:.2f}, {xy[1]:.2f}) heading {math.degrees(yaw):.0f}")
-        ok = self._run_action(goal_handle, self.track_path, self.track_path_name, goal, self.goal_timeout,
-                              lambda r: r.status == TrackPath.Result.STATUS_SUCCESS)
-        if not ok and self._pause_enabled:
-            # The incident handler may have preempted us before its flag got here
-            self._wait(goal_handle, lambda: self._incident, self.preempt_grace)
-            self._check(goal_handle)
-        return ok
+        return self._run_action(goal_handle, self.track_path, self.track_path_name, goal, self.goal_timeout,
+                                lambda r: r.status == TrackPath.Result.STATUS_SUCCESS)
 
-    def _hold(self, goal_handle, buoy: Buoy, position: int, total: int):
-        self.get_logger().warning(f"Incident: holding at buoy {buoy.index} ({buoy.state})")
-        self._feedback(goal_handle, "PAUSED", buoy, position, total)
+    # Task 4 Core
+
+    def _on_assistance(self, msg: AssistanceRequest):
+        """Accept a request once per seq, only for this vehicle type and while a goal answers them."""
         with self._lock:
-            self._target = None
-        start = time.monotonic()
-        event = threading.Event()
+            if msg.seq in self._seen:  # each request once, however often it is delivered
+                return
+            self._seen.add(msg.seq)
+            where = f"({msg.position.latitude:.7f}, {msg.position.longitude:.7f})"
+            if msg.vehicle_type != self.vehicle_type:
+                self.get_logger().info(f"Assistance request {msg.seq} to {where} is for '{msg.vehicle_type}', not "
+                                       f"'{self.vehicle_type}': ignored")
+                return
+            if not self._respond:
+                self.get_logger().warning(f"Assistance request {msg.seq} to {where} ignored: no Safe Passage goal "
+                                          "answering requests is running. It stays ignored")
+                return
+            if self._pending is not None:
+                self._end(self._pending, "superseded")
+            self._pending = Incident(msg.seq, msg.position.latitude, msg.position.longitude, time.monotonic())
+            self._incidents.append(self._pending)
+            self.get_logger().warning(f"Assistance request {msg.seq} to {where}: accepted, interrupting")
+
+    def _on_confirm(self, msg: ReadinessConfirm):
+        if msg.vehicle_id != self.vehicle_id:
+            self.get_logger().info(f"Readiness confirm {msg.seq} is for '{msg.vehicle_id}', not '{self.vehicle_id}': "
+                                   "ignored", throttle_duration_sec=5.0)
+            return
+        with self._lock:
+            new = msg.report_seq not in self._confirms
+            self._confirms[msg.report_seq] = msg.seq  # kept: it may arrive before we know our report's seq
+        if new:
+            self.get_logger().info(f"Readiness confirm {msg.seq} for report {msg.report_seq} received")
+
+    def _end(self, incident: Incident, state: str):
+        """Final state of a request. Call with _lock held."""
+        incident.state, incident.ended = state, time.monotonic()
+
+    def _answer_assistance(self, goal_handle, total: int):
+        """Answer every waiting request, newest last, then switch the task back. Raises Canceled."""
+        answered = False
         while True:
-            while self._incident and self._pause_enabled:
-                if goal_handle.is_cancel_requested:
-                    raise Canceled()
-                event.wait(POLL_S)
-            settle_end = time.monotonic() + self.resume_settle
-            while time.monotonic() < settle_end and not self._incident:
-                if goal_handle.is_cancel_requested:
-                    raise Canceled()
-                event.wait(POLL_S)
-            if not self._incident:
+            with self._lock:
+                incident, self._pending = self._pending, None
+                self._incident = incident
+            if incident is None:
                 break
-        self.get_logger().info(f"Incident cleared after {time.monotonic() - start:.0f} s: "
-                               f"buoy {buoy.index} ({buoy.state}) starts over")
+            answered = True
+            try:
+                outcome = self._respond_to(goal_handle, incident, total)
+            except Assistance:  # a newer request arrived while this one was being answered
+                outcome = "superseded"
+            with self._lock:
+                self._end(incident, outcome)
+                self._incident = None
+                self._target = None
+            took = incident.ended - incident.received
+            if outcome == "confirmed":
+                self.get_logger().info(f"Assistance request {incident.seq}: confirmed after {took:.0f} s")
+            else:
+                self.get_logger().warning(f"Assistance request {incident.seq}: {outcome} after {took:.0f} s")
+        if answered:
+            self._send_task(self.resume_task)
+            self.get_logger().info("Back to Safe Passage: the interrupted step starts over")
+
+    def _respond_to(self, goal_handle, incident: Incident, total: int) -> str:
+        """Ack, go there, report ready, wait for the confirm. Returns how it ended. Raises Assistance or Canceled."""
+        seq = incident.seq
+
+        def state(name: str, phase: str):
+            with self._lock:
+                incident.state = name
+            goal_handle.publish_feedback(SafePassage.Feedback(phase=phase, buoy_total=total))
+
+        state("transit", "INCIDENT_TRANSIT")
+        self._send_incident_ack(seq)          # both in the background: the boat moves at once
+        self._send_task(self.incident_task)
+        station = self._from_ll(incident.latitude, incident.longitude)
+        if station is None:
+            self.get_logger().error(f"Assistance request {seq}: fromLL failed for its position")
+            return "no_position"
+        tries = 1 + max(0, int(self.incident_goal_retries))
+        for attempt in range(1, tries + 1):
+            boat = self._boat_xy()
+            yaw = math.atan2(station[1] - boat[1], station[0] - boat[0]) if boat is not None else 0.0
+            if self._drive(goal_handle, station, yaw, f"Assistance request {seq} transit {attempt}/{tries}",
+                           self.incident_sample_radius, self.incident_tolerance):
+                break
+        else:
+            self.get_logger().error(f"Assistance request {seq}: position ({station[0]:.2f}, {station[1]:.2f}) not "
+                                    "reached, no ReadinessReport sent")
+            return "unreachable"
+
+        state("on_station", "INCIDENT_ON_STATION")
+        report_seq = self._send_readiness(goal_handle, seq)
+        if report_seq is None:
+            self.get_logger().error(f"Assistance request {seq}: on station but the ReadinessReport did not go out")
+            return "report_failed"
+        with self._lock:
+            incident.report_seq = report_seq
+        self.get_logger().info(f"Assistance request {seq}: on station, ReadinessReport sent as report {report_seq}; "
+                               f"holding for its ReadinessConfirm, up to {self.readiness_confirm_timeout:.0f} s")
+
+        def confirmed():
+            self._check(goal_handle)
+            with self._lock:
+                return report_seq in self._confirms
+
+        if self._wait(goal_handle, confirmed, self.readiness_confirm_timeout):
+            return "confirmed"
+        return "confirm_timeout"
+
+    def _send_incident_ack(self, seq: int):
+        goal = SendIncidentAck.Goal()
+        goal.report.command_seq = seq
+        self._send_in_background(self.incident_ack, self.incident_ack_name, goal, f"IncidentAck for {seq}")
+
+    def _send_task(self, task: str):
+        self._send_in_background(self.set_task, self.set_task_name, SetTask.Goal(task=task), f"SetTask {task}")
+
+    def _send_readiness(self, goal_handle, seq: int) -> Optional[int]:
+        """Send the ReadinessReport, retried; returns the seq of the report that carried it."""
+        goal = SendReadinessReport.Goal()
+        goal.report.command_seq = seq
+        for attempt in range(1, 2 + max(0, int(self.report_retries))):
+            sent = {}
+
+            def ok(result):
+                sent["seq"] = result.seq
+                return not result.error
+
+            if self._run_action(goal_handle, self.readiness, self.readiness_name, goal, self.report_timeout, ok):
+                return int(sent["seq"])
+            self.get_logger().warning(f"ReadinessReport for {seq}: attempt {attempt} failed")
+        return None
+
+    def _send_in_background(self, client: ActionClient, name: str, goal, what: str):
+        """Send a report-style goal without holding up the boat: retried, every outcome logged."""
+        def run():
+            for attempt in range(1, 2 + max(0, int(self.report_retries))):
+                error = self._send_blocking(client, goal)
+                if error is None:
+                    self.get_logger().info(f"{what}: sent")
+                    return
+                self.get_logger().warning(f"{what}: attempt {attempt} failed ({error})")
+                time.sleep(1.0)
+            self.get_logger().error(f"{what}: not sent")
+        threading.Thread(target=run, name=what, daemon=True).start()
+
+    def _send_blocking(self, client: ActionClient, goal) -> Optional[str]:
+        """Send a goal and wait for its result on events (the executor runs the callbacks). None when it went out."""
+        if not client.wait_for_server(timeout_sec=self.service_timeout):
+            return "server unavailable"
+        accepted, done = threading.Event(), threading.Event()
+        send = client.send_goal_async(goal)
+        send.add_done_callback(lambda _: accepted.set())
+        if not accepted.wait(self.service_timeout) or not send.result().accepted:
+            return "goal not accepted"
+        result = send.result().get_result_async()
+        result.add_done_callback(lambda _: done.set())
+        if not done.wait(self.report_timeout):
+            return f"no result within {self.report_timeout:.0f} s"
+        return result.result().result.error or None
 
     # Plumbing
 
     def _check(self, goal_handle):
         if goal_handle.is_cancel_requested:
             raise Canceled()
-        if self._pause_enabled and self._incident:
-            raise Paused()
+        if self._pending is not None:
+            raise Assistance()
 
     def _wait(self, goal_handle, done: Callable[[], bool], timeout: float) -> bool:
         """Poll done until it holds or timeout passes. Never spins: the executor runs the callbacks."""
@@ -507,13 +706,15 @@ class SafePassageNode(Node):
                 self.get_logger().error(f"{name} timed out after {timeout:.0f} s, canceling")
                 child.cancel_goal_async()
                 return False
-        except (Canceled, Paused):
+        except (Canceled, Assistance):
             if send.done() and send.result().accepted:
                 send.result().cancel_goal_async()
             raise
-        succeeded = ok(result.result().result)
+        outcome = result.result().result
+        succeeded = ok(outcome)
         if not succeeded:
-            self.get_logger().warning(f"{name} did not succeed (status {result.result().result.status})")
+            detail = f"status {outcome.status}" if hasattr(outcome, "status") else f"error '{outcome.error}'"
+            self.get_logger().warning(f"{name} did not succeed ({detail})")
         return succeeded
 
     def _from_ll(self, latitude: float, longitude: float) -> Optional[np.ndarray]:
@@ -554,11 +755,6 @@ class SafePassageNode(Node):
             return
         self._grid = geo.CostGrid.from_msg(msg)
         self._align_step(self._grid)
-
-    def _on_incident(self, msg: Bool):
-        if msg.data != self._incident:
-            self.get_logger().warning(f"Incident flag {'set' if msg.data else 'cleared'}")
-        self._incident = bool(msg.data)
 
     def _snapshot(self) -> geo.CostGrid:
         grid = self._grid

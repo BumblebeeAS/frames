@@ -1,4 +1,4 @@
-"""safe_passage_node with stubbed TrackPath, TF, fromLL and costmap: alignment, order, directions, retries, pause."""
+"""safe_passage_node with stubbed TrackPath, TF, fromLL and costmap: alignment, order, retries, Task 4 Core."""
 import math
 import sys
 import threading
@@ -12,7 +12,7 @@ import pytest
 
 rclpy = pytest.importorskip("rclpy")
 pytest.importorskip("bb_robotx_msgs")
-from bb_robotx_msgs.msg import SafePassageBuoy  # noqa: E402
+from bb_robotx_msgs.msg import AssistanceRequest, ReadinessConfirm, SafePassageBuoy  # noqa: E402
 
 if "robot_localization" not in sys.modules:
     try:
@@ -45,9 +45,9 @@ def buoy(state, xy):
 
 
 class Goal:
-    def __init__(self, buoys, pause=False):
+    def __init__(self, buoys, respond=False):
         self.is_cancel_requested = False
-        self.request = SimpleNamespace(buoys=buoys, pause_on_incident=pause)
+        self.request = SimpleNamespace(buoys=buoys, respond_to_assistance=respond)
         self.feedback = []
 
     def publish_feedback(self, msg):
@@ -57,16 +57,19 @@ class Goal:
 class Harness:
     """Stubs the node's I/O. results: per-goal bools (default True), or callables run when that goal is sent."""
 
-    def __init__(self, node, buoys, results=(), boat=(-10.0, 0.0), pause=False):
-        self.node, self.goal = node, Goal(buoys, pause)
+    def __init__(self, node, buoys, results=(), boat=(-10.0, 0.0), respond=False):
+        self.node, self.goal = node, Goal(buoys, respond)
+        self.acks, self.tasks, self.reports, self.report_seq = [], [], [], 412
+        node._send_incident_ack = self.acks.append
+        node._send_task = self.tasks.append
+        node._send_readiness = lambda gh, seq: (self.reports.append(seq), self.report_seq)[1]
         self.results, self.boat, self.targets = list(results), np.array(boat), []
         node._boat_xy = lambda: self.boat
         node._snapshot = geo.CostGrid.empty
         node._from_ll = lambda lat, lon: np.array([lat, lon])
         node._run_action = self._run_action
         node.align_timeout = 0.0  # no costmap in most tests: go straight on with the drone's positions
-        node.preempt_grace = 0.2
-        node.resume_settle = 0.05
+        node.readiness_confirm_timeout = 5.0
 
     def _run_action(self, gh, client, name, goal, timeout, ok):
         xy = np.array([goal.goal_pose.pose.position.x, goal.goal_pose.pose.position.y])
@@ -169,40 +172,145 @@ def test_failed_red_requeued_once_before_the_exit(node):
     assert np.linalg.norm(h.targets[-1] - EXIT) < 3.0
 
 
-def test_incident_mid_circle_holds_then_redoes_the_buoy(node):
-    def incident():
-        node._incident = True
-        threading.Timer(0.2, lambda: setattr(node, "_incident", False)).start()
+STATION = [30.0, 12.0]
+
+
+def assistance(seq=30, xy=STATION, vehicle_type="usv"):
+    msg = AssistanceRequest(seq=seq, vehicle_type=vehicle_type)
+    msg.position.latitude, msg.position.longitude = xy  # the stubbed fromLL maps lat, lon -> x, y
+    return msg
+
+
+def confirm(report_seq=412, vehicle_id="USV1", seq=99):
+    return ReadinessConfirm(seq=seq, report_seq=report_seq, vehicle_id=vehicle_id)
+
+
+def later(delay, fn, *args):
+    threading.Timer(delay, fn, args).start()
+
+
+def request_now(node, *args, **kwargs):
+    """A result callable: the request arrives while this TrackPath goal is being driven."""
+    def arrive():
+        node._on_assistance(assistance(*args, **kwargs))
+        return True
+    return arrive
+
+
+def test_assistance_request_mid_circle_runs_the_core_chain_then_redoes_the_buoy(node):
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, True, request_now(node)], respond=True)
+    later(0.3, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and "1 attempt(s)" in message, message      # the interrupted attempt does not count
+    assert "assistance request 30 confirmed" in message
+    assert h.acks == [30] and h.reports == [30]
+    assert h.tasks == ["dynamic_incident", "safe_passage"]
+    phases = h.phases()
+    assert phases.index("INCIDENT_TRANSIT") < phases.index("INCIDENT_ON_STATION")
+    assert phases[phases.index("INCIDENT_ON_STATION") + 1] == "TRANSIT"   # the buoy starts over
+    per = node.circle_points + node.circle_overshoot_points + 1
+    np.testing.assert_allclose(h.targets[3], STATION)
+    assert len(h.targets) == 3 + 1 + per
+    assert node._pending is None and node._incident is None
+    assert [x.state for x in node._incidents] == ["confirmed"] and node._incidents[0].report_seq == 412
+
+
+def test_request_for_another_vehicle_type_is_ignored(node):
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node, vehicle_type="uuv")],
+                respond=True)
+    ok, circled, failed, message = h.run()
+    assert ok and h.acks == [] and h.tasks == [] and "assistance" not in message
+    assert "INCIDENT_TRANSIT" not in h.phases()
+
+
+def test_request_is_ignored_when_the_goal_does_not_ask_for_it(node):
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node)])
+    assert h.run()[0] and h.acks == [] and "INCIDENT_TRANSIT" not in h.phases()
+
+
+def test_request_before_a_goal_stays_ignored_when_repeated_during_one(node):
+    node._on_assistance(assistance(seq=30))               # nothing running: turned down
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node, seq=30)], respond=True)
+    assert h.run()[0] and h.acks == [] and node._incidents == []
+
+
+def test_repeated_request_is_answered_once(node):
+    def repeat():
+        for _ in range(3):                                # delivered more than once
+            node._on_assistance(assistance())
         return True
 
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, True, incident], pause=True)
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, repeat], respond=True)
+    later(0.2, node._on_assistance, assistance())
+    later(0.3, node._on_confirm, confirm())
     ok, circled, failed, message = h.run()
-    assert ok and "1 attempt(s)" in message, message  # the paused attempt does not count
-    assert "PAUSED" in h.phases()
-    after = h.phases()[h.phases().index("PAUSED") + 1]
-    assert after == "TRANSIT"
-    per = node.circle_points + node.circle_overshoot_points + 1
-    assert len(h.targets) == 3 + per
+    assert ok and h.acks == [30] and h.reports == [30] and len(node._incidents) == 1
 
 
-def test_preempted_goal_waits_for_the_late_incident_flag(node):
-    def preempted():
-        threading.Timer(0.05, lambda: setattr(node, "_incident", True)).start()
-        threading.Timer(0.4, lambda: setattr(node, "_incident", False)).start()
-        return False
-
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, preempted], pause=True)
+def test_only_our_confirm_for_our_report_releases_the_hold(node):
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node)], respond=True)
+    node.readiness_confirm_timeout = 0.6
+    later(0.1, node._on_confirm, confirm(vehicle_id="USV2"))        # another vehicle's
+    later(0.15, node._on_confirm, confirm(report_seq=411))          # ours, another report
+    started = time.monotonic()
     ok, circled, failed, message = h.run()
-    assert ok and "1 attempt(s)" in message, message
-    assert "PAUSED" in h.phases()
+    assert time.monotonic() - started >= 0.6
+    assert ok and circled == 1 and "assistance request 30 confirm_timeout" in message
+    assert h.tasks == ["dynamic_incident", "safe_passage"]          # resumes on its own after the timeout
 
 
-def test_incident_ignored_without_pause_on_incident(node):
-    node._incident = True
-    h = Harness(node, [buoy("flashing_red", [0, 0])])
-    assert h.run()[0]
-    assert "PAUSED" not in h.phases()
-    node._incident = False
+def test_confirm_that_beats_the_report_seq_still_counts(node):
+    def arrive():
+        node._on_assistance(assistance())
+        node._on_confirm(confirm())                       # before the ReadinessReport action has returned 412
+        return True
+
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, arrive], respond=True)
+    started = time.monotonic()
+    ok, circled, failed, message = h.run()
+    assert ok and "assistance request 30 confirmed" in message and time.monotonic() - started < 2.0
+
+
+def test_newer_request_replaces_the_one_in_hand(node):
+    other = [-20.0, -9.0]
+    h = Harness(node, [buoy("flashing_red", [0, 0])], respond=True,
+                results=[True, request_now(node, seq=30), request_now(node, seq=31, xy=other)])
+    later(0.3, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and "assistance request 30 superseded" in message and "assistance request 31 confirmed" in message
+    assert h.acks == [30, 31] and h.reports == [31]
+    np.testing.assert_allclose(h.targets[2], STATION)
+    np.testing.assert_allclose(h.targets[3], other)
+    assert h.tasks[-1] == "safe_passage" and h.tasks.count("safe_passage") == 1
+
+
+def test_unreachable_station_sends_no_readiness_report_and_resumes(node):
+    h = Harness(node, [buoy("flashing_red", [0, 0])], respond=True,
+                results=[True, request_now(node), False, False, False])
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 1 and "assistance request 30 unreachable" in message
+    assert h.acks == [30] and h.reports == [] and h.tasks == ["dynamic_incident", "safe_passage"]
+    assert "INCIDENT_ON_STATION" not in h.phases()
+
+
+def test_readiness_report_that_cannot_be_sent_resumes_without_waiting(node):
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node)], respond=True)
+    h.report_seq = None
+    started = time.monotonic()
+    ok, circled, failed, message = h.run()
+    assert ok and "assistance request 30 report_failed" in message and time.monotonic() - started < 2.0
+
+
+def test_request_during_align_is_answered_then_alignment_goes_on(node):
+    h = Harness(node, [buoy("flashing_red", [0, 0])], respond=True)
+    node.align_timeout = 0.5
+    later(0.15, node._on_assistance, assistance())
+    later(0.4, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 1 and "assistance request 30 confirmed" in message
+    phases = h.phases()
+    assert phases[0] == "ALIGN" and "ALIGN" in phases[phases.index("INCIDENT_ON_STATION"):]
+    np.testing.assert_allclose(h.targets[0], STATION)
 
 
 def test_cancel_stops_everything(node):
@@ -218,14 +326,13 @@ def test_cancel_stops_everything(node):
     assert len(h.targets) == 2
 
 
-def test_cancel_while_paused(node):
-    node._incident = True
-    h = Harness(node, [buoy("flashing_red", RED)], pause=True)
-    threading.Timer(0.2, lambda: setattr(h.goal, "is_cancel_requested", True)).start()
+def test_cancel_while_holding_on_station(node):
+    h = Harness(node, [buoy("flashing_red", RED)], results=[True, request_now(node)], respond=True)
+    later(0.3, setattr, h.goal, "is_cancel_requested", True)
     with pytest.raises(spn.Canceled):
         h.run()
-    assert h.targets == []
-    node._incident = False
+    assert h.reports == [30] and h.tasks == ["dynamic_incident"]
+    assert node._incidents[0].state == "on_station"   # _execute closes it as canceled when the goal ends
 
 
 LAYOUT = np.array([[0.0, 0.0], [9.0, 3.0], [10.0, -3.0], [20.0, 0.0], [15.0, 8.0], [5.0, -8.0]])
@@ -304,3 +411,55 @@ def test_circle_follows_a_blob_near_the_drone_position_without_a_lock(node):
     assert ok and "BLOB" in message, message
     radii = np.linalg.norm(np.array(h.targets) - [10.7, 0.0], axis=1)
     assert radii.max() - radii.min() < 0.15
+
+
+def test_reports_go_out_through_real_actions(ros):
+    """The Task 4 senders against real action servers: IncidentAck, SetTask, and the ReadinessReport's seq."""
+    from bb_robotx_msgs.action import SendIncidentAck, SendReadinessReport, SetTask
+    from rclpy.action import ActionServer
+    from rclpy.executors import MultiThreadedExecutor
+    from rclpy.node import Node
+
+    got = []
+
+    def serve(kind, result):
+        def execute(goal_handle):
+            request = goal_handle.request
+            got.append((kind, request.task if kind == "task" else request.report.command_seq))
+            goal_handle.succeed()
+            return result()
+        return execute
+
+    ocs = Node("fake_ocs_bridge")
+    servers = [
+        ActionServer(ocs, SendIncidentAck, "/asv5/report/incident_ack",
+                     serve("ack", lambda: SendIncidentAck.Result(seq=411))),
+        ActionServer(ocs, SendReadinessReport, "/asv5/report/readiness",
+                     serve("ready", lambda: SendReadinessReport.Result(seq=412))),
+        ActionServer(ocs, SetTask, "/asv5/set_task", serve("task", lambda: SetTask.Result(error="no heartbeat"))),
+    ]
+    node = spn.SafePassageNode()
+    node.report_retries, node.report_timeout = 0, 5.0
+    executor = MultiThreadedExecutor()
+    executor.add_node(ocs)
+    executor.add_node(node)
+    spinner = threading.Thread(target=executor.spin, daemon=True)
+    spinner.start()
+    try:
+        ack = SendIncidentAck.Goal()
+        ack.report.command_seq = 30
+        assert node._send_blocking(node.incident_ack, ack) is None
+        assert node._send_blocking(node.set_task, SetTask.Goal(task="dynamic_incident")) == "no heartbeat"
+        assert node._send_readiness(Goal([]), 30) == 412
+        assert got == [("ack", 30), ("task", "dynamic_incident"), ("ready", 30)]
+        node._send_incident_ack(31)                       # the background path, as the chain uses it
+        deadline = time.monotonic() + 5.0
+        while ("ack", 31) not in got and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert ("ack", 31) in got
+    finally:
+        executor.shutdown(timeout_sec=2.0)
+        for server in servers:
+            server.destroy()
+        node.destroy_node()
+        ocs.destroy_node()

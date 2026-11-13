@@ -56,11 +56,11 @@ class CostGrid:
         return np.maximum(out, 0)
 
 
-def order_buoys(positions: Sequence, states: Sequence[str], boat) -> list[int]:
-    """Circling order: the entry, the reds and greens, the exit. Black buoys are left out.
+def course(positions: Sequence, states: Sequence[str], boat) -> tuple[np.ndarray, Optional[np.ndarray]]:
+    """Where the course starts and its direction (unit vector), or None when it has none.
 
-    Reds and greens are sorted by their projection on the line from the start (the entry, else the boat) to the end
-    (the exit, else the reds' and greens' centroid). If start and end coincide they go nearest-next from the start.
+    From the entry (else the boat) to the exit (else the reds' and greens' centroid). Reds are left to starboard
+    and greens to port going this way.
     """
     positions = [np.asarray(p, dtype=float)[:2] for p in positions]
     entry = next((i for i, s in enumerate(states) if s == ENTRY), None)
@@ -75,8 +75,21 @@ def order_buoys(positions: Sequence, states: Sequence[str], boat) -> list[int]:
         end = start
     axis = end - start
     length = float(np.linalg.norm(axis))
-    if length > 1.0:
-        middle.sort(key=lambda i: float(np.dot(positions[i] - start, axis / length)))
+    return start, (axis / length if length > 1.0 else None)
+
+
+def order_buoys(positions: Sequence, states: Sequence[str], boat) -> list[int]:
+    """Circling order: the entry, the reds and greens, the exit. Black buoys are left out.
+
+    Reds and greens are sorted along the course (see course()). Without a course they go nearest-next from the start.
+    """
+    positions = [np.asarray(p, dtype=float)[:2] for p in positions]
+    entry = next((i for i, s in enumerate(states) if s == ENTRY), None)
+    exit_ = next((i for i, s in enumerate(states) if s == EXIT), None)
+    middle = [i for i, s in enumerate(states) if s in (RED, GREEN)]
+    start, direction = course(positions, states, boat)
+    if direction is not None:
+        middle.sort(key=lambda i: float(np.dot(positions[i] - start, direction)))
     else:
         ordered, at = [], start
         while middle:
@@ -86,6 +99,45 @@ def order_buoys(positions: Sequence, states: Sequence[str], boat) -> list[int]:
             at = positions[nearest]
         middle = ordered
     return ([entry] if entry is not None else []) + middle + ([exit_] if exit_ is not None else [])
+
+
+def pass_waypoint(centre, state: str, direction, offset: float) -> np.ndarray:
+    """The point beside a red or green buoy that passes it on the right side going along direction.
+
+    Left of a red (it stays on starboard), right of a green (it stays on port).
+    """
+    direction = np.asarray(direction, dtype=float)[:2]
+    left = np.array([-direction[1], direction[0]])
+    return np.asarray(centre, dtype=float)[:2] + (left if state == RED else -left) * offset
+
+
+def find_gates(positions: Sequence, states: Sequence[str], direction, min_width: float, max_width: float,
+               max_angle: float) -> list[tuple[int, int]]:
+    """(red, green) pairs to cross between as one manoeuvre, narrowest first, each buoy in at most one.
+
+    A pair is a gate when it is min_width to max_width apart and crossing it with the red on starboard is within
+    max_angle (rad) of direction: going along the course then passes both on the right side at once.
+    """
+    positions = [np.asarray(p, dtype=float)[:2] for p in positions]
+    direction = np.asarray(direction, dtype=float)[:2]
+    candidates = []
+    for r, sr in enumerate(states):
+        for g, sg in enumerate(states):
+            if sr != RED or sg != GREEN:
+                continue
+            across = positions[g] - positions[r]
+            width = float(np.linalg.norm(across))
+            if not min_width <= width <= max_width:
+                continue
+            crossing = np.array([across[1], -across[0]]) / width   # red on starboard, green on port
+            if math.acos(max(-1.0, min(1.0, float(crossing @ direction)))) <= max_angle:
+                candidates.append((width, r, g))
+    gates, used = [], set()
+    for _, r, g in sorted(candidates):
+        if r not in used and g not in used:
+            gates.append((r, g))
+            used.update((r, g))
+    return gates
 
 
 def nearest_other(points) -> np.ndarray:

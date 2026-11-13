@@ -10,8 +10,11 @@ circled one at a time with stop-and-go TrackPath goals:
   CIRCLE   TrackPath to p1 .. pN+overshoot, N points per 360 deg; each goal waits for the previous one's result
 
 The entry is fully circled clockwise and the exit counterclockwise. Reds and greens only have to be passed on the
-right side, so they get a semicircle: pass_points steps from the same start point, clockwise for red (it stays on
-starboard), counterclockwise for green (on port).
+right side, so each gets one TrackPath goal: a waypoint pass_offset beside it, left of a red (it stays on starboard)
+and right of a green (on port) going along the course, which runs from the entry to the exit (to the middle of the
+reds and greens when no exit is known). A red and a green close enough to go between, facing the course, are a gate:
+one waypoint midway passes both. Reds, greens and gates are visited in order along the course. With pass_points > 0
+a red or green gets that many circle steps from a tangent start point instead (3 of 6 is a semicircle).
 
 The drone's positions can be metres off as one layout, so before driving the node lines the layout up with the
 costmap (frames.utils.buoy_align): ALIGN holds until the shift locks or align_timeout passes, and the buoys are
@@ -122,6 +125,7 @@ class Buoy:
     attempts: int = 0
     estimate: Optional[ba.Estimate] = None  # the one the last circle used
     radius: float = 0.0
+    gate: Optional[int] = None          # index of the buoy it was passed with as a gate
 
 
 class SafePassageNode(Node):
@@ -154,7 +158,11 @@ class SafePassageNode(Node):
         self.neighbour_clearance = param("neighbour_clearance", 1.25)
         self.circle_points = param("circle_points", 6)
         self.circle_overshoot_points = param("circle_overshoot_points", 1)
-        self.pass_points = param("pass_points", 3)  # reds and greens: 3 of 6 steps is a semicircle
+        self.pass_points = param("pass_points", 0)      # reds and greens: 0 = one waypoint beside the buoy
+        self.pass_offset = param("pass_offset", 1.8)
+        self.gate_min_width = param("gate_min_width", 2.4)
+        self.gate_max_width = param("gate_max_width", 6.0)
+        self.gate_max_angle = param("gate_max_angle", 60.0)  # deg
         self.cost_threshold = param("cost_threshold", 22)
 
         # TrackPath
@@ -208,6 +216,7 @@ class SafePassageNode(Node):
         self._circle: list = []      # [(xy, yaw)] being driven, for markers
         self._target: Optional[np.ndarray] = None
         self._logged_t = np.zeros(2)
+        self._course: Optional[np.ndarray] = None     # unit direction of the course for the running goal, if it has one
         # Task 4 Core, all under _lock. A request moves (_held ->) _pending -> _incident -> ended and never back.
         self._respond = False                         # the running goal answers AssistanceRequests
         self._seen: set[int] = set()                  # request seqs taken or turned down by the running goal
@@ -322,23 +331,31 @@ class SafePassageNode(Node):
         boat = self._boat_xy()
         with self._lock:
             placed = aligner.predicted()
-        order = geo.order_buoys(list(placed), [b.state for b in buoys],
-                                boat if boat is not None else placed.mean(axis=0))
-        self.get_logger().info(f"Order {order}")
+        states = [b.state for b in buoys]
+        origin = boat if boat is not None else placed.mean(axis=0)
+        start, self._course = geo.course(list(placed), states, origin)
+        order = geo.order_buoys(list(placed), states, origin)
+        legs = self._legs(buoys, order, start)
+        heading = ("none" if self._course is None
+                   else f"{math.degrees(math.atan2(self._course[1], self._course[0])):.0f} deg")
+        self.get_logger().info(f"Course {heading}; legs " + ", ".join(
+            "gate " + "-".join(str(b.index) for b in leg) if len(leg) > 1 else str(leg[0].index) for leg in legs))
 
-        total = len(order)
-        exit_ = [i for i in order if buoys[i].state == geo.EXIT]
-        for position, i in enumerate(i for i in order if buoys[i].state != geo.EXIT):
-            self._do_buoy(goal_handle, buoys[i], position, total)
+        total = len(legs)
+        for position, leg in enumerate(legs):
+            if leg[0].state != geo.EXIT:
+                self._do_leg(goal_handle, leg, position, total)
         if self.requeue_failed:
-            for i in order:
-                b = buoys[i]
-                if b.status == "failed" and b.state in (geo.RED, geo.GREEN):
-                    self.get_logger().info(f"Buoy {i} ({b.state}): requeued for one more attempt before the exit")
-                    b.attempts = max(0, int(self.buoy_attempts) - 1)
-                    self._do_buoy(goal_handle, b, order.index(i), total)
-        for i in exit_:
-            self._do_buoy(goal_handle, buoys[i], order.index(i), total)
+            for position, leg in enumerate(legs):
+                for b in leg:  # a failed gate is retried one buoy at a time
+                    if b.status == "failed" and b.state in (geo.RED, geo.GREEN):
+                        self.get_logger().info(f"Buoy {b.index} ({b.state}): requeued for one more attempt before "
+                                               "the exit")
+                        b.attempts, b.gate = max(0, int(self.buoy_attempts) - 1), None
+                        self._do_leg(goal_handle, [b], position, total)
+        for position, leg in enumerate(legs):
+            if leg[0].state == geo.EXIT:
+                self._do_leg(goal_handle, leg, position, total)
         self._answer_assistance(goal_handle, total)  # a request that came in as the last buoy finished
 
         circled = [b for b in buoys if b.status == "circled"]
@@ -350,6 +367,8 @@ class SafePassageNode(Node):
             detail = (f", {e.source} {np.linalg.norm(e.xy - b.xy):.2f} m from the drone, R {b.radius:.2f}"
                       if e is not None else "")
             outcome = self._done_word(b) if b.status == "circled" else b.status
+            if b.gate is not None:
+                outcome += f" as a gate with {b.gate}"
             lines.append(f"{i}:{b.state} {outcome} ({b.attempts} attempt(s){detail})")
         with self._lock:
             incidents = [f"assistance request {x.seq} {x.state}"
@@ -422,7 +441,91 @@ class SafePassageNode(Node):
         else:
             self.get_logger().debug(f"Locked t ({t[0]:.2f}, {t[1]:.2f}), {matched} matched. {detail}")
 
-    # One buoy
+    # Legs: one manoeuvre each
+
+    def _legs(self, buoys: list, order: list, start) -> list:
+        """The goal's manoeuvres in order: [entry], reds, greens and [red, green] gates along the course, [exit]."""
+        singles = [[buoys[i]] for i in order]
+        if self._course is None or self.pass_points > 0:
+            return singles
+        where = [self._estimate(b).xy for b in buoys]  # on their blobs where they have one
+        gates = geo.find_gates(where, [b.state for b in buoys], self._course, self.gate_min_width,
+                               self.gate_max_width, math.radians(self.gate_max_angle))
+        paired = {i for gate in gates for i in gate}
+        middle = [leg for leg in singles if leg[0].state in (geo.RED, geo.GREEN) and leg[0].index not in paired]
+        middle += [[buoys[r], buoys[g]] for r, g in gates]
+        middle.sort(key=lambda leg: float((np.mean([where[b.index] for b in leg], axis=0) - start) @ self._course))
+        return ([leg for leg in singles if leg[0].state == geo.ENTRY] + middle
+                + [leg for leg in singles if leg[0].state == geo.EXIT])
+
+    def _do_leg(self, goal_handle, leg: list, position: int, total: int):
+        waypoint = self.pass_points <= 0 and self._course is not None and leg[0].state in (geo.RED, geo.GREEN)
+        if waypoint:
+            self._do_pass(goal_handle, leg, position, total)
+        else:
+            self._do_buoy(goal_handle, leg[0], position, total)
+
+    def _do_pass(self, goal_handle, leg: list, position: int, total: int):
+        """Pass a red or green, or a red-green gate, with one waypoint. The buoys of a gate share their attempts."""
+        what = (f"Gate {leg[0].index}-{leg[1].index} (red-green)" if len(leg) > 1
+                else f"Buoy {leg[0].index} ({leg[0].state})")
+        while max(b.attempts for b in leg) < self.buoy_attempts:
+            for b in leg:
+                b.attempts += 1
+            label = f"{what} attempt {leg[0].attempts}/{self.buoy_attempts}"
+            try:
+                ok = self._pass_attempt(goal_handle, leg, label, position, total)
+            except Assistance:
+                for b in leg:
+                    b.attempts -= 1  # an incident is not a failed attempt
+                self._answer_assistance(goal_handle, total)
+                continue
+            if ok:
+                for b in leg:
+                    b.status = "circled"
+                self.get_logger().info(f"{label}: passed")
+                return
+            self.get_logger().warning(f"{label}: failed")
+        for b in leg:
+            b.status = "failed"
+
+    def _pass_attempt(self, goal_handle, leg: list, label: str, position: int, total: int) -> bool:
+        """One waypoint, read again and retried point_retries times. Raises Assistance or Canceled."""
+        for retry in range(1 + max(0, int(self.point_retries))):
+            estimates = [self._estimate(b) for b in leg]
+            for b, e in zip(leg, estimates):
+                b.estimate = e
+            if len(leg) > 1:  # between them, heading the way that keeps the red on starboard
+                red, green = estimates[0].xy, estimates[1].xy
+                across = green - red
+                width = float(np.linalg.norm(across))
+                target = (red + green) / 2.0
+                yaw = math.atan2(-across[0], across[1])
+                for b, other in zip(leg, reversed(leg)):
+                    b.radius, b.gate = width / 2.0, other.index
+                detail = (f"midway between ({red[0]:.2f}, {red[1]:.2f}) from {estimates[0].source} and "
+                          f"({green[0]:.2f}, {green[1]:.2f}) from {estimates[1].source}, {width:.2f} m apart")
+            else:
+                b, e = leg[0], estimates[0]
+                nearest = min((float(np.linalg.norm(np.asarray(n) - e.xy)) for n in self._neighbours(b)),
+                              default=math.inf)
+                # Beside it by pass_offset, less when another buoy is close, never less than half a gate's width
+                offset = max(min(self.pass_offset, nearest - self.neighbour_clearance), self.gate_min_width / 2.0)
+                target = geo.pass_waypoint(e.xy, b.state, self._course, offset)
+                yaw = math.atan2(self._course[1], self._course[0])
+                b.radius = offset
+                detail = (f"{offset:.2f} m to the {'left' if b.state == geo.RED else 'right'} of ({e.xy[0]:.2f}, "
+                          f"{e.xy[1]:.2f}) from {e.source}, {np.linalg.norm(e.xy - b.xy):.2f} m from the drone "
+                          f"(nearest other buoy {nearest:.2f} m)")
+            self.get_logger().info(f"{label}: waypoint ({target[0]:.2f}, {target[1]:.2f}) {detail}")
+            with self._lock:
+                self._circle = [(target, yaw)]
+            self._feedback(goal_handle, "TRANSIT", leg[0], position, total, 0, 0, estimates[0].source)
+            if self._drive(goal_handle, target, yaw, f"{label} waypoint"):
+                return True
+        return False
+
+    # One buoy, circled
 
     def _do_buoy(self, goal_handle, buoy: Buoy, position: int, total: int):
         restarts = 0

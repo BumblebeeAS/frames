@@ -41,15 +41,22 @@ safe_passage_node:
     estimate_restart_threshold: 1.5  # E_i moving more than this mid-circle (a late lock) starts the buoy over
     buoy_restarts: 2               # at most this often per buoy; after that the points are only re-placed
 
-    # Circle (entry, exit): start point + circle_points per 360 deg + overshoot. Pass (red, green): see pass_points
+    # Circle (entry, exit): start point + circle_points per 360 deg + overshoot
     circle_radius: 2.5
     circle_radius_min: 1.6         # tracker cost boundary ~1.05 m from a buoy mark, plus margin
     circle_radius_step: 0.25
     neighbour_clearance: 1.25      # R <= nearest other buoy - this (robot radius 0.75 + 0.5)
     circle_points: 6               # 60 deg apart: the straight leg between two passes 0.87 x R from the centre
     circle_overshoot_points: 1
-    pass_points: 3                 # reds and greens are passed, not circled: this many steps from the start point
-                                   # (3 x 60 deg = a semicircle), clockwise for red, counterclockwise for green
+    # Reds and greens are passed, not circled. The course runs from the entry to the exit (to the middle of the
+    # reds and greens when no exit is known); they are visited in order along it.
+    pass_points: 0                 # 0: one waypoint beside the buoy. > 0: that many circle steps from a tangent
+                                   # start point instead (3 of 6 is a semicircle)
+    pass_offset: 1.8               # waypoint this far beside the buoy: left of a red, right of a green, along the
+                                   # course. Less when another buoy is close (neighbour_clearance), at least 1.2
+    gate_min_width: 2.4            # a red and a green this far apart ...
+    gate_max_width: 6.0
+    gate_max_angle: 60.0           # ... facing within this of the course are a gate: one waypoint midway for both
     cost_threshold: 22             # = tracker sample_cost_threshold: a circle point at or above is blocked
 
     # TrackPath (replan tracker), one goal at a time, specified_heading false, heading along the circle

@@ -69,6 +69,7 @@ class Harness:
         node._snapshot = geo.CostGrid.empty
         node._from_ll = lambda lat, lon: np.array([lat, lon])
         node._run_action = self._run_action
+        node.pass_points = 3      # these tests exercise the circle machinery on reds: semicircles, as before
         node.align_timeout = 0.0  # no costmap in most tests: go straight on with the drone's positions
         node.readiness_confirm_timeout = 5.0
 
@@ -733,3 +734,112 @@ def goal_rejected_without_known_buoys(node):
     from rclpy.action import GoalResponse
     request = SimpleNamespace(buoys=[buoy("unknown", [0.0, 0.0]), buoy("off", [1.0, 1.0])])
     return node._on_goal(request) == GoalResponse.REJECT
+
+
+def side_of(boat_from, boat_to, buoy_xy):
+    """'port' or 'starboard': where buoy_xy is for a boat arriving at boat_to from boat_from."""
+    heading = np.asarray(boat_to) - np.asarray(boat_from)
+    to_buoy = np.asarray(buoy_xy) - np.asarray(boat_to)
+    return "port" if heading[0] * to_buoy[1] - heading[1] * to_buoy[0] > 0 else "starboard"
+
+
+def test_node_defaults_to_one_waypoint_per_red_and_green(node):
+    import yaml
+    assert node.pass_points == 0
+    cfg = yaml.safe_load(open(ROOT / "cfg/asv5_safe_passage.yaml"))["safe_passage_node"]["ros__parameters"]
+    assert cfg["pass_points"] == 0 and cfg["pass_offset"] == node.pass_offset == 1.8
+    assert cfg["gate_min_width"] == node.gate_min_width and cfg["gate_max_width"] == node.gate_max_width
+
+
+def test_reds_and_greens_get_one_waypoint_on_the_right_side_along_the_course(node):
+    # course east from the entry to the exit; the red and the green are too far apart to be a gate
+    red, green = [8.0, 5.0], [13.0, -5.0]
+    h = Harness(node, [buoy("steady_blue", EXIT), buoy("flashing_green", green), buoy("off", BLACK),
+                       buoy("flashing_red", red), buoy("flashing_blue", ENTRY)])
+    node.pass_points = 0
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 4, message
+    full = goals(node, "flashing_blue")
+    assert len(h.targets) == full + 1 + 1 + full                    # entry circle, red, green, exit circle
+    red_wp, green_wp = h.targets[full], h.targets[full + 1]
+    np.testing.assert_allclose(red_wp, [8.0, 5.0 + node.pass_offset])       # left of the red going east
+    np.testing.assert_allclose(green_wp, [13.0, -5.0 - node.pass_offset])   # right of the green
+    assert side_of(h.targets[full - 1], red_wp, red) == "starboard"
+    assert side_of(red_wp, green_wp, green) == "port"
+    order = message.split("; ")
+    assert [o.split(" ")[1] for o in order[:4]] == ["circled", "passed", "passed", "circled"]
+    assert h.phases().count("TRANSIT") == 4
+
+
+def test_red_and_green_facing_the_course_are_passed_as_one_gate(node):
+    red, green = [10.0, -2.0], [10.0, 2.0]                          # red to starboard, green to port going east
+    h = Harness(node, [buoy("flashing_blue", ENTRY), buoy("flashing_red", red), buoy("flashing_green", green),
+                       buoy("steady_blue", EXIT)])
+    node.pass_points = 0
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 4, message
+    full = goals(node, "flashing_blue")
+    assert len(h.targets) == full + 1 + full                        # one waypoint for both
+    np.testing.assert_allclose(h.targets[full], [10.0, 0.0])        # midway
+    assert "1:flashing_red passed as a gate with 2" in message and "2:flashing_green passed as a gate with 1" in message
+
+
+def test_pair_facing_against_the_course_is_not_a_gate(node):
+    red, green = [10.0, 2.0], [10.0, -2.0]                          # going between them east would put the red on port
+    h = Harness(node, [buoy("flashing_blue", ENTRY), buoy("flashing_red", red), buoy("flashing_green", green),
+                       buoy("steady_blue", EXIT)])
+    node.pass_points = 0
+    ok, circled, failed, message = h.run()
+    assert ok and "gate" not in message
+    full = goals(node, "flashing_blue")
+    assert len(h.targets) == full + 2 + full
+    wps = np.array(h.targets[full:full + 2])
+    off = node.pass_offset
+    assert sorted(wps[:, 1].round(2).tolist()) == [-2.0 - off, 2.0 + off]   # each on its own outer side
+
+
+def test_waypoint_keeps_clear_of_a_close_neighbour(node):
+    h = Harness(node, [buoy("flashing_blue", ENTRY), buoy("flashing_red", [10.0, 0.0]), buoy("off", [10.0, 2.6]),
+                       buoy("steady_blue", EXIT)])
+    node.pass_points = 0
+    assert h.run()[0]
+    full = goals(node, "flashing_blue")
+    offset = h.targets[full][1]                                     # left of the red, toward the black buoy
+    assert offset == pytest.approx(2.6 - node.neighbour_clearance)  # 1.35 m, not the 1.8 m default
+    assert offset >= node.gate_min_width / 2.0
+
+
+def test_failed_gate_is_retried_one_buoy_at_a_time(node):
+    red, green = [10.0, -2.0], [10.0, 2.0]
+    h = Harness(node, [buoy("flashing_blue", ENTRY), buoy("flashing_red", red), buoy("flashing_green", green),
+                       buoy("steady_blue", EXIT)])
+    node.pass_points, node.buoy_attempts = 0, 1
+    full = goals(node, "flashing_blue")
+    h.results = [True] * full + [False, False]                      # the gate waypoint and its retry fail
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 4, message
+    assert len(h.targets) == full + 2 + 2 + full                    # gate twice, then each buoy alone, then the exit
+    assert "gate" not in message                                    # passed alone in the end
+
+
+def test_waypoint_that_fails_every_time_fails_the_buoy_and_the_run_goes_on(node):
+    h = Harness(node, [buoy("flashing_blue", ENTRY), buoy("flashing_red", [8.0, 5.0]), buoy("steady_blue", EXIT)])
+    node.pass_points = 0
+    full = goals(node, "flashing_blue")
+    h.results = [True] * full + [False] * 6                         # 2 attempts x 2 tries, then the requeue x 2
+    ok, circled, failed, message = h.run()
+    assert not ok and circled == 2 and failed == 1 and "1:flashing_red failed" in message
+    assert len(h.targets) == full + 6 + full
+
+
+def test_assistance_request_at_a_waypoint_is_answered_then_the_waypoint_is_driven_again(node):
+    h = Harness(node, [buoy("flashing_blue", ENTRY), buoy("flashing_red", [8.0, 5.0]), buoy("steady_blue", EXIT)],
+                respond=True)
+    node.pass_points = 0
+    full = goals(node, "flashing_blue")
+    h.results = [True] * full + [request_now(node)]
+    later(0.3, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 3 and "1:flashing_red passed (1 attempt(s)" in message
+    np.testing.assert_allclose(h.targets[full + 1], STATION)
+    np.testing.assert_allclose(h.targets[full + 2], h.targets[full])   # the same waypoint again

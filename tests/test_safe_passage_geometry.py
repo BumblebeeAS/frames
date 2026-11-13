@@ -107,3 +107,43 @@ def test_radius_reports_still_blocked_at_minimum():
     grid = grid_with([(0, 0), (1.6, 0), (2.0, 0), (2.5, 0)])
     r, why = geo.choose_radius(grid, [0, 0], [], 2.5, 1.6, 0.25, 1.25, 22)
     assert r == pytest.approx(1.6) and "still blocked" in why
+
+
+def test_course_runs_from_the_entry_to_the_exit_or_the_middle_of_the_reds_and_greens():
+    P = [[0, 0], [10, 2], [10, -2], [20, 0]]
+    start, d = geo.course(P, ["flashing_blue", "flashing_red", "flashing_green", "steady_blue"], [50, 50])
+    np.testing.assert_allclose(start, [0, 0])
+    np.testing.assert_allclose(d, [1, 0])
+    start, d = geo.course(P[:3], ["flashing_blue", "flashing_red", "flashing_green"], [50, 50])
+    np.testing.assert_allclose(d, [1, 0])                          # toward the middle of the red and the green
+    start, d = geo.course(P[1:3], ["flashing_red", "flashing_green"], [10, -30])
+    np.testing.assert_allclose(start, [10, -30])                   # no entry: from the boat
+    np.testing.assert_allclose(d, [0, 1])
+    assert geo.course([[0, 0]], ["flashing_blue"], [5, 5])[1] is None
+
+
+def test_pass_waypoint_keeps_red_on_starboard_and_green_on_port():
+    east = [1.0, 0.0]
+    np.testing.assert_allclose(geo.pass_waypoint([5, 5], "flashing_red", east, 2.0), [5, 7])     # north of it
+    np.testing.assert_allclose(geo.pass_waypoint([5, 5], "flashing_green", east, 2.0), [5, 3])   # south of it
+    for state, want in (("flashing_red", -1), ("flashing_green", 1)):
+        w = geo.pass_waypoint([5, 5], state, east, 2.0)
+        to_buoy = np.array([5, 5]) - w
+        side = east[0] * to_buoy[1] - east[1] * to_buoy[0]         # > 0: the buoy is on the boat's left (port)
+        assert np.sign(side) == want
+
+
+def test_gates_are_pairs_that_face_the_course_and_fit_the_width():
+    east = [1.0, 0.0]
+    states = ["flashing_red", "flashing_green", "flashing_red", "flashing_green", "off"]
+    # red south and green north of the course line: crossed going east with the red on starboard
+    assert geo.find_gates([[10, -2], [10, 2], [40, 40], [60, 60], [10, 0]], states, east, 2.4, 6.0, math.radians(60)) \
+        == [(0, 1)]
+    # the other way round only works going west: not a gate
+    limits = (2.4, 6.0, math.radians(60))
+    assert geo.find_gates([[10, 2], [10, -2], [40, 40], [60, 60], [0, 0]], states, east, *limits) == []
+    # too narrow to go between, and too wide to be one manoeuvre
+    assert geo.find_gates([[10, -1], [10, 1], [40, -4], [40, 4], [0, 0]], states, east, *limits) == []
+    # each buoy in one gate only, the narrowest pairs first
+    got = geo.find_gates([[10, -2], [10, 2], [10.5, -2.5], [11, 2.6], [0, 0]], states, east, *limits)
+    assert got == [(0, 1), (2, 3)]

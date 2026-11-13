@@ -1,67 +1,87 @@
-"""safe_passage_node._run with stubbed TrackPath, Encircle, TF and costmap: call order, retries and outcomes."""
-import importlib.util
+"""safe_passage_node with stubbed TrackPath, TF, fromLL and costmap: order, directions, retries, pause, lidar."""
 import math
+import sys
 import threading
 import time
+import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 rclpy = pytest.importorskip("rclpy")
 pytest.importorskip("bb_robotx_msgs")
+from bb_robotx_msgs.msg import SafePassageBuoy  # noqa: E402
+
+if "robot_localization" not in sys.modules:
+    try:
+        import robot_localization.srv  # noqa: F401
+    except ImportError:  # only fromLL's type is needed, and _from_ll is stubbed below
+        from std_srvs.srv import Trigger
+        package = types.ModuleType("robot_localization")
+        package.srv = types.ModuleType("robot_localization.srv")
+        package.srv.FromLL = Trigger
+        sys.modules["robot_localization"], sys.modules["robot_localization.srv"] = package, package.srv
 
 ROOT = Path(__file__).parents[1]
-geo_spec = importlib.util.spec_from_file_location("frames.utils.safe_passage_geometry",
-                                                  ROOT / "frames/utils/safe_passage_geometry.py")
-geo = importlib.util.module_from_spec(geo_spec)
-geo_spec.loader.exec_module(geo)
+sys.path.insert(0, str(ROOT))
+import importlib.util  # noqa: E402
+
+from frames.utils import safe_passage_geometry as geo  # noqa: E402
+
 spec = importlib.util.spec_from_file_location("safe_passage_node", ROOT / "scripts/safe_passage_node.py")
 spn = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(spn)
 
-ENTRY, EXIT = np.array([0.0, 0.0]), np.array([30.0, 0.0])
-GATE1, GATE2 = np.array([10.0, 5.0]), np.array([20.0, 5.0])
+ENTRY, RED, GREEN, EXIT, BLACK = [0.0, 0.0], [9.0, 3.0], [10.0, -3.0], [20.0, 0.0], [15.0, 8.0]
+
+
+def buoy(state, xy):
+    b = SafePassageBuoy(state=state)
+    b.position.latitude, b.position.longitude = xy  # the stubbed fromLL maps lat, lon -> x, y
+    return b
 
 
 class Goal:
-    def __init__(self):
+    def __init__(self, buoys, pause=False):
         self.is_cancel_requested = False
-        self.request = type("Request", (), {"path_topic": ""})()
+        self.request = SimpleNamespace(buoys=buoys, pause_on_incident=pause)
+        self.feedback = []
 
-    def publish_feedback(self, _):
-        pass
+    def publish_feedback(self, msg):
+        self.feedback.append(msg)
 
 
 class Harness:
-    """Stubs the node's I/O. track_results: per-call bools (default True); grids: per-snapshot CostGrids."""
+    """Stubs the node's I/O. results: per-goal bools (default True), or callables run when that goal is sent."""
 
-    def __init__(self, node, points, track_results=(), grids=(), boat=(0.0, -10.0)):
-        self.node, self.calls, self.goal = node, [], Goal()
-        self.track_results, self.grids, self.boat = list(track_results), list(grids), np.array(boat)
-        node._track = self._track
-        node._circle = lambda gh, c, r, t: self.calls.append(("circle", np.round(c, 2), r, t)) or True
-        node._boat_xy = lambda: None if self.boat is None else self.boat
-        node._snapshot = lambda: self.grids.pop(0) if self.grids else geo.CostGrid.empty()
-        node._wait_for_path = lambda gh, topic: object()
-        node._from_ll = lambda path: [np.asarray(p, dtype=float) for p in points]
-        self.costmap_waits = 0
-        node._wait_for_costmap_since = lambda gh, since: setattr(self, "costmap_waits", self.costmap_waits + 1)
+    def __init__(self, node, buoys, results=(), boat=(-10.0, 0.0), pause=False):
+        self.node, self.goal = node, Goal(buoys, pause)
+        self.results, self.boat, self.targets = list(results), np.array(boat), []
+        node._boat_xy = lambda: self.boat
+        node._snapshot = geo.CostGrid.empty
+        node._from_ll = lambda lat, lon: np.array([lat, lon])
+        node._run_action = self._run_action
+        node.preempt_grace = 0.2
+        node.resume_settle = 0.05
 
-    def _track(self, gh, xy, yaw, tol, stab):
-        self.node._check_cancel(gh)
-        xy = np.asarray(xy, dtype=float)
-        self.calls.append(("track", xy.copy(), math.degrees(yaw)))
-        ok = self.track_results.pop(0) if self.track_results else True
-        if ok:
+    def _run_action(self, gh, client, name, goal, timeout, ok):
+        xy = np.array([goal.goal_pose.pose.position.x, goal.goal_pose.pose.position.y])
+        self.targets.append(xy)
+        result = self.results.pop(0) if self.results else True
+        if callable(result):
+            result = result()
+        self.node._check(gh)
+        if result:
             self.boat = xy
-        return ok
+        return result
 
     def run(self):
         return self.node._run(self.goal)
 
-    def tracks(self):
-        return [c for c in self.calls if c[0] == "track"]
+    def phases(self):
+        return [f.phase for f in self.goal.feedback]
 
 
 @pytest.fixture(scope="module")
@@ -78,268 +98,160 @@ def node(ros):
     n.destroy_node()
 
 
-def kinds(h):
-    return [c[0] for c in h.calls]
+def swept(points, centre):
+    """Signed swept angle (deg) of a run of points about centre: negative is clockwise."""
+    angles = np.unwrap([math.atan2(p[1] - centre[1], p[0] - centre[0]) for p in points])
+    return math.degrees(angles[-1] - angles[0])
 
 
-def test_all_legs_succeed_in_order(node):
-    h = Harness(node, [ENTRY, GATE1, GATE2, EXIT])
-    assert h.run() == (True, "all legs succeeded")
-    # approach, circle, 3 legs x 2 gates, approach, circle
-    assert kinds(h) == ["track", "circle"] + ["track"] * 6 + ["track", "circle"]
-    assert h.calls[1][3] == 380.0 and h.calls[-1][3] == -380.0
-    legs = [c[1] for c in h.tracks()[1:7]]
-    d1 = geo.crossing_direction(ENTRY, GATE2)
-    assert np.allclose(legs[:3], [GATE1 - d1, GATE1, GATE1 + d1])  # 1 m lead, clean costmap
-    for leg in h.tracks()[1:4]:
-        assert leg[2] == pytest.approx(math.degrees(math.atan2(d1[1], d1[0])))  # shared crossing yaw
+def test_order_directions_and_point_counts(node):
+    h = Harness(node, [buoy("steady_blue", EXIT), buoy("flashing_green", GREEN), buoy("off", BLACK),
+                       buoy("flashing_red", RED), buoy("flashing_blue", ENTRY)])
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 4 and failed == 0, message
+    per = node.circle_points + node.circle_overshoot_points + 1  # start point + circle
+    assert len(h.targets) == 4 * per
+    # entry, red (x 9), green (x 10), exit; black never circled
+    centres = [ENTRY, RED, GREEN, EXIT]
+    order = message.split("; ")
+    assert [o.split(" ")[0] for o in order] == ["4:flashing_blue", "3:flashing_red", "1:flashing_green",
+                                                "0:steady_blue"]
+    for n, centre in enumerate(centres):
+        run = h.targets[n * per:(n + 1) * per]
+        np.testing.assert_allclose(np.linalg.norm(np.array(run) - centre, axis=1), run and
+                                   np.linalg.norm(run[0] - np.array(centre)), atol=1e-6)
+        sigma = 1 if n < 2 else -1
+        assert swept(run, centre) == pytest.approx(-sigma * 405.0, abs=1e-6)
+    assert h.phases().count("TRANSIT") == 4
 
 
-def test_approach_retry_moves_round_the_ring(node):
-    h = Harness(node, [ENTRY, EXIT], track_results=[False, True])
-    ok, msg = h.run()
-    assert ok, msg
-    first, second = h.tracks()[0][1], h.tracks()[1][1]
-    assert np.linalg.norm(first) == pytest.approx(4.0) and np.linalg.norm(second) == pytest.approx(4.0)
-    assert np.linalg.norm(second - first) > node.approach_exclude_radius
+def test_radius_shrinks_for_a_close_neighbour(node):
+    h = Harness(node, [buoy("flashing_red", [0, 0]), buoy("off", [3.2, 0])])
+    h.run()
+    r = np.linalg.norm(h.targets[0])
+    assert r == pytest.approx(3.2 - node.neighbour_clearance)
 
 
-def test_approach_failing_every_attempt_still_circles(node):
-    h = Harness(node, [ENTRY, EXIT], track_results=[False, False, False])
-    ok, msg = h.run()
-    assert not ok and msg == "failed: ENTRY_APPROACH"
-    targets = [c[1] for c in h.tracks()[:3]]
-    assert all(np.linalg.norm(a - b) > 1.0 for i, a in enumerate(targets) for b in targets[i + 1:])  # 3 distinct
-    assert kinds(h)[3] == "circle"
+def test_failed_point_is_retried_then_skipped(node):
+    # start ok, point 1 fails twice (retry included) -> skipped, rest ok
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, False, False])
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 1, message
+    np.testing.assert_allclose(h.targets[1], h.targets[2])  # the retry re-sends the same point on a still map
+    assert len(h.targets) == 1 + 2 + (node.circle_points + node.circle_overshoot_points - 1)
 
 
-def test_leg_retry_resends_the_same_target_on_a_clean_costmap(node):
-    # approach ok, circle, before ok, middle fails twice then succeeds
-    h = Harness(node, [ENTRY, GATE1, EXIT], track_results=[True, True, False, False, True])
-    ok, msg = h.run()
-    assert ok, msg
-    middles = [c[1] for c in h.tracks()[2:5]]
-    assert all(np.allclose(m, GATE1) for m in middles)
+def test_two_skips_in_a_row_fail_the_attempt_and_the_second_attempt_starts_over(node):
+    h = Harness(node, [buoy("flashing_green", [0, 0])], results=[True, False, False, False, False])
+    ok, circled, failed, message = h.run()
+    assert ok and "2 attempt(s)" in message, message
+    assert h.phases().count("TRANSIT") == 2
 
 
-def test_leg_failing_every_attempt_is_skipped(node):
-    h = Harness(node, [ENTRY, GATE1, EXIT], track_results=[True, True, False, False, False])
-    ok, msg = h.run()
-    assert not ok and msg == "failed: WAYPOINT 1 leg 2"
-    assert kinds(h).count("track") == 1 + 1 + 3 + 1 + 1  # approach, before, 3x middle, after, exit approach
+def test_start_point_unreachable_fails_the_attempt(node):
+    node.buoy_attempts = 1
+    h = Harness(node, [buoy("flashing_blue", [0, 0])], results=[False, False])
+    ok, circled, failed, message = h.run()
+    assert not ok and failed == 1 and "failed" in message
+    assert len(h.targets) == 2
 
 
-def test_middle_stays_ahead_when_the_costmap_changes_between_legs(node):
-    # Clean snapshot for the before leg, then the lidar sees a return just ahead of the midpoint
-    blocked = geo.CostGrid(np.zeros((200, 200), dtype=np.int16), 0.1, 0.0, -5.0)
-    d = geo.crossing_direction(ENTRY, EXIT)  # (1, 0): gate on the entry-exit line
-    gate = np.array([10.0, 0.0])
-    xs = np.arange(200) * 0.1 + 0.05
-    gx, gy = np.meshgrid(xs, xs - 5.0)
-    blocked.data[np.hypot(gx - 10.3, gy) < 0.5] = 100
-    # snapshots: entry centre, entry approach, entry re-snap, before (clean), middle, after (blocked)
-    clean = geo.CostGrid.empty
-    h = Harness(node, [ENTRY, gate, EXIT], grids=[clean(), clean(), clean(), clean(), blocked, blocked])
-    ok, msg = h.run()
-    assert ok, msg
-    before, middle, after = (c[1] for c in h.tracks()[1:4])
-    assert np.allclose(before, gate - d)  # sampled on the clean snapshot
-    assert not np.allclose(middle, gate) and blocked.cost(middle)[0] == 0  # moved off the new return
-    assert np.dot(middle - before, d) >= node.lead_distance - node.sample_radius - 1e-9
-    assert np.dot(after - middle, d) > 0
+def test_failed_red_requeued_once_before_the_exit(node):
+    node.buoy_attempts = 1
+    h = Harness(node, [buoy("flashing_red", RED), buoy("steady_blue", EXIT)], results=[False, False])
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 2, message  # the requeued attempt succeeded
+    np.testing.assert_allclose(np.linalg.norm(h.targets[2] - RED), np.linalg.norm(h.targets[0] - RED))
+    per = node.circle_points + node.circle_overshoot_points + 1
+    assert len(h.targets) == 2 + per + per
+    assert np.linalg.norm(h.targets[-1] - EXIT) < 3.0
 
 
-def test_no_lead_drives_the_middle_only(node):
-    node.lead_distance = 0.0
-    h = Harness(node, [ENTRY, GATE1, EXIT])
-    assert h.run()[0]
-    assert kinds(h) == ["track", "circle", "track", "track", "circle"]
-    assert np.allclose(h.tracks()[1][1], GATE1)
-
-
-def test_no_retries_means_one_attempt(node):
-    node.track_retries = 0
-    h = Harness(node, [ENTRY, EXIT], track_results=[False])
-    assert h.run() == (False, "failed: ENTRY_APPROACH")
-    assert kinds(h) == ["track", "circle", "track", "circle"]
-
-
-def test_no_boat_pose_skips_the_approach_but_circles(node):
-    h = Harness(node, [ENTRY, EXIT], boat=None)
-    h.boat = None
-    ok, msg = h.run()
-    assert msg == "failed: ENTRY_APPROACH, EXIT_APPROACH"
-    assert kinds(h) == ["circle", "circle"]
-
-
-def test_cancel_during_an_attempt_stops_everything(node):
-    h = Harness(node, [ENTRY, GATE1, EXIT])
-
-    def cancel_on_second(gh, xy, yaw, tol, stab):
-        h.calls.append(("track", np.asarray(xy), yaw))
-        if len(h.tracks()) == 2:
-            gh.is_cancel_requested = True
-        node._check_cancel(gh)
+def test_incident_mid_circle_holds_then_redoes_the_buoy(node):
+    def incident():
+        node._incident = True
+        threading.Timer(0.2, lambda: setattr(node, "_incident", False)).start()
         return True
 
-    node._track = cancel_on_second
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, True, incident], pause=True)
+    ok, circled, failed, message = h.run()
+    assert ok and "1 attempt(s)" in message, message  # the paused attempt does not count
+    assert "PAUSED" in h.phases()
+    after = h.phases()[h.phases().index("PAUSED") + 1]
+    assert after == "TRANSIT"
+    per = node.circle_points + node.circle_overshoot_points + 1
+    assert len(h.targets) == 3 + per
+
+
+def test_preempted_goal_waits_for_the_late_incident_flag(node):
+    def preempted():
+        threading.Timer(0.05, lambda: setattr(node, "_incident", True)).start()
+        threading.Timer(0.4, lambda: setattr(node, "_incident", False)).start()
+        return False
+
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, preempted], pause=True)
+    ok, circled, failed, message = h.run()
+    assert ok and "1 attempt(s)" in message, message
+    assert "PAUSED" in h.phases()
+
+
+def test_incident_ignored_without_pause_on_incident(node):
+    node._incident = True
+    h = Harness(node, [buoy("flashing_red", [0, 0])])
+    assert h.run()[0]
+    assert "PAUSED" not in h.phases()
+    node._incident = False
+
+
+def test_cancel_stops_everything(node):
+    h = Harness(node, [buoy("flashing_red", RED), buoy("steady_blue", EXIT)])
+
+    def cancel():
+        h.goal.is_cancel_requested = True
+        return True
+
+    h.results = [True, cancel]
     with pytest.raises(spn.Canceled):
         h.run()
-    assert kinds(h) == ["track", "circle", "track"]
+    assert len(h.targets) == 2
 
 
-def test_entry_and_exit_only(node):
-    h = Harness(node, [ENTRY, EXIT])
-    assert h.run() == (True, "all legs succeeded")
-    assert kinds(h) == ["track", "circle", "track", "circle"]
-    # approach heading points at the clockwise tangent point
-    point, yaw = h.tracks()[0][1], h.tracks()[0][2]
-    run = geo.tangent_point(ENTRY, 2.5, point, clockwise=True) - point
-    assert yaw == pytest.approx(math.degrees(math.atan2(run[1], run[0])))
-
-
-def watch_zone(h):
-    """Records, with every snapshot, track and circle, whether a keep-out zone was active then."""
-    node, snapshot, track, circle = h.node, h.node._snapshot, h.node._track, h.node._circle
-    h.zone_seen = []
-
-    def seen(kind):
-        h.zone_seen.append((kind, node._zone_active))
-
-    node._snapshot = lambda: seen("snapshot") or snapshot()
-    node._track = lambda *a: seen("track") or track(*a)
-    node._circle = lambda *a: seen("circle") or circle(*a)
-
-
-def clear_zone_after(node, seconds):
-    timer = threading.Timer(seconds, lambda: setattr(node, "_zone_active", False))
-    timer.start()
-    return timer
-
-
-def test_zone_active_at_start_holds_everything_until_it_clears(node):
-    h = Harness(node, [ENTRY, GATE1, EXIT])
-    watch_zone(h)
-    node._zone_active = True
-    clear_zone_after(node, 0.3)
-    start = time.monotonic()
-    assert h.run() == (True, "all legs succeeded")
-    assert time.monotonic() - start >= 0.3
-    assert h.zone_seen and not any(active for _, active in h.zone_seen)
-    assert h.costmap_waits == 1  # once, after the first hold
-
-
-def test_zone_during_a_leg_holds_the_next_attempt_and_the_circle(node):
-    h = Harness(node, [ENTRY, EXIT], track_results=[False, True])
-    watch_zone(h)
-    track = node._track
-
-    def zone_on_first(*a):
-        ok = track(*a)
-        if len(h.tracks()) == 1:  # the zone lands while the first approach runs, which then fails
-            node._zone_active = True
-            clear_zone_after(node, 0.3)
-        return ok
-
-    node._track = zone_on_first
-    start = time.monotonic()
-    assert h.run() == (True, "all legs succeeded")
-    assert time.monotonic() - start >= 0.3
-    # the retry and everything after it waited for the zone to clear
-    assert kinds(h) == ["track", "track", "circle", "track", "circle"]
-    assert not any(active for _, active in h.zone_seen)
-    assert h.costmap_waits == 1
-
-
-def test_cancel_while_holding_for_a_zone(node):
-    h = Harness(node, [ENTRY, EXIT])
-    node._zone_active = True
+def test_cancel_while_paused(node):
+    node._incident = True
+    h = Harness(node, [buoy("flashing_red", RED)], pause=True)
     threading.Timer(0.2, lambda: setattr(h.goal, "is_cancel_requested", True)).start()
     with pytest.raises(spn.Canceled):
         h.run()
-    assert h.calls == []
+    assert h.targets == []
+    node._incident = False
 
 
-def test_mask_callback_sets_zone_active(node):
-    from nav_msgs.msg import OccupancyGrid
-    msg = OccupancyGrid()
-    msg.data = [0, 0, 100, 0]
-    node._on_keepout_mask(msg)
-    assert node._zone_active
-    msg.data = [0]
-    node._on_keepout_mask(msg)
-    assert not node._zone_active
+def test_cloud_feeds_landmarks_and_moves_the_circle_onto_them(node):
+    """A buoy 1.2 m off the drone's position, seen by the lidar: the circle is centred on what the lidar sees."""
+    from sensor_msgs.msg import PointCloud2, PointField
+    from sensor_msgs_py.point_cloud2 import create_cloud
+    from frames.utils import buoy_field as bf
 
-
-def buoy_at(xy, size=0.3):
-    """30 x 30 m grid at 0.1 m from (-5, -15), lethal within size of xy."""
-    g = geo.CostGrid(np.zeros((300, 300), dtype=np.int16), 0.1, -5.0, -15.0)
-    xs = np.arange(300) * 0.1 + 0.05
-    gx, gy = np.meshgrid(xs - 5.0, xs - 15.0)
-    g.data[np.hypot(gx - xy[0], gy - xy[1]) < size] = 100
-    return g
-
-
-def test_circle_resnaps_onto_a_buoy_seen_only_after_the_approach(node):
-    # snapshots: entry centre (buoy out of range), entry approach, entry re-snap (seen 0.6 m off), exit x3
-    seen = buoy_at(ENTRY + [0.6, 0.0])
-    clean = geo.CostGrid.empty
-    h = Harness(node, [ENTRY, EXIT], grids=[clean(), clean(), seen])
-    assert h.run() == (True, "all legs succeeded")
-    circles = [c for c in h.calls if c[0] == "circle"]
-    assert np.allclose(circles[0][1], ENTRY + [0.6, 0.0], atol=0.05)  # the buoy, not the drone's estimate
-    assert np.linalg.norm(h.tracks()[0][1] - ENTRY) == pytest.approx(4.0)  # approach still planned on the estimate
-
-
-def test_circle_resnap_keeps_a_centre_already_snapped(node):
-    seen = buoy_at(ENTRY + [0.6, 0.0])
-    h = Harness(node, [ENTRY, EXIT], grids=[seen, seen, seen])
-    assert h.run() == (True, "all legs succeeded")
-    circles = [c for c in h.calls if c[0] == "circle"]
-    assert np.allclose(circles[0][1], ENTRY + [0.6, 0.0], atol=0.05)
-
-
-def test_circle_stays_on_the_estimate_when_the_buoy_is_never_seen(node):
-    h = Harness(node, [ENTRY, EXIT])
-    assert h.run() == (True, "all legs succeeded")
-    circles = [c for c in h.calls if c[0] == "circle"]
-    assert np.allclose(circles[0][1], ENTRY) and np.allclose(circles[1][1], EXIT)
-    assert circles[0][2] == node.circle_radius
-
-
-def test_exit_circle_resnaps_too(node):
-    seen = buoy_at(EXIT - [30.0, 0.0] + [0.0, 0.5])  # grid spans x -5..25: shift the buoy into it below
-    exit_seen = geo.CostGrid(seen.data, 0.1, 25.0, -15.0)  # same grid moved to x 25..55
-    clean = geo.CostGrid.empty
-    h = Harness(node, [ENTRY, EXIT], grids=[clean(), clean(), clean(), clean(), clean(), exit_seen])
-    assert h.run() == (True, "all legs succeeded")
-    circles = [c for c in h.calls if c[0] == "circle"]
-    assert np.allclose(circles[0][1], ENTRY) and np.allclose(circles[1][1], EXIT + [0.0, 0.5], atol=0.05)
-
-
-def test_costmap_wait_takes_only_a_costmap_stamped_after_the_clear(node):
-    from nav_msgs.msg import OccupancyGrid
-    from rclpy.duration import Duration
-    goal = Goal()
-    since = node.get_clock().now() + Duration(seconds=0.3)
-    old = OccupancyGrid()
-    old.header.stamp = node.get_clock().now().to_msg()
-    node._costmap = old
-    new = OccupancyGrid()
-
-    def publish_new():
-        new.header.stamp = node.get_clock().now().to_msg()
-        node._costmap = new
-
-    threading.Timer(0.5, publish_new).start()
-    start = time.monotonic()
-    node._wait_for_costmap_since(goal, since)
-    assert 0.4 <= time.monotonic() - start < 1.5 and node._costmap is new
-
-
-def test_costmap_wait_gives_up_without_costmaps(node):
-    node.zone_clear_settle = 0.1
-    node._costmap = None
-    start = time.monotonic()
-    node._wait_for_costmap_since(Goal(), node.get_clock().now())
-    assert time.monotonic() - start == pytest.approx(2.1, abs=0.3)
+    truth = np.array([11.2, 0.0])
+    h = Harness(node, [buoy("flashing_red", [10.0, 0.0])], boat=(0.0, 0.0))
+    node._field = bf.BuoyField([[10.0, 0.0]], node.field_params)
+    node._buoys = [spn.Buoy(0, "flashing_red", np.array([10.0, 0.0]), 1)]
+    node.base_link_frame_id = "asv5/base_link"
+    # Boat at the origin, base_link = map: the transform is identity
+    identity = SimpleNamespace(transform=SimpleNamespace(
+        translation=SimpleNamespace(x=0.0, y=0.0, z=0.0), rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)))
+    node.tf_buffer.lookup_transform = lambda *a, **k: identity
+    face = np.stack([np.full(8, truth[0] - 0.2), np.linspace(-0.2, 0.2, 8), np.full(8, 0.2)], 1)
+    hull = np.array([[0.3, 0.1, 0.2], [-0.4, 0.3, 0.2], [0.5, -0.2, 0.3]])  # own boat: masked
+    fields = [PointField(name=n, offset=4 * i, datatype=PointField.FLOAT32, count=1) for i, n in enumerate("xyz")]
+    for _ in range(4):
+        from std_msgs.msg import Header
+        cloud = create_cloud(Header(frame_id="asv5/base_link"), fields, np.vstack([face, hull]).tolist())
+        node._last_cloud = 0.0
+        node._on_cloud(cloud)
+    assert len(node._field.usable()) == 1
+    estimate = node._estimate(node._buoys[0])
+    assert estimate.source == bf.LANDMARK
+    assert np.linalg.norm(estimate.xy - [truth[0] - 0.2, 0.0]) < 0.05  # the visible face
+    node._publish_markers()  # must not raise
+    node._field, node._buoys = None, []

@@ -1,16 +1,13 @@
-"""Offline checks for the Safe Passage costmap sampling."""
-import importlib.util
+"""Offline checks for the Safe Passage geometry: order, circle points and radius."""
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-spec = importlib.util.spec_from_file_location(
-    'safe_passage_geometry', Path(__file__).parents[1] / 'frames/utils/safe_passage_geometry.py'
-)
-geo = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(geo)
+sys.path.insert(0, str(Path(__file__).parents[1]))
+from frames.utils import safe_passage_geometry as geo  # noqa: E402
 
 RES = 0.1
 
@@ -31,113 +28,78 @@ def grid_with(buoys=(), inflation=1.0, size=40.0):
 EMPTY = geo.CostGrid.empty()
 
 
-def test_empty_grid_returns_nominal_answers():
-    nominal = np.array([3.0, 4.0])
-    assert np.allclose(geo.snap_centre(EMPTY, nominal, 1.0), nominal)
-    assert geo.choose_radius(EMPTY, nominal, 2.5, 0.5) == 2.5
-    assert np.allclose(geo.sample_point(EMPTY, nominal, 1.0), nominal)
-    approach = geo.choose_approach(EMPTY, [0, 0], 2.5, 1.5, boat=[0, -10], clockwise=True, threshold=50)
-    assert np.allclose(approach, [0.0, -4.0])  # straight between the boat and the buoy
+def test_order_entry_middles_by_projection_exit_and_no_blacks():
+    positions = [[30, 0], [20, 3], [0, 0], [5, -2], [12, 1], [10, 10]]
+    states = [geo.EXIT, geo.GREEN, geo.ENTRY, geo.RED, geo.BLACK, geo.RED]
+    assert geo.order_buoys(positions, states, boat=[-10, 0]) == [2, 3, 5, 1, 0]
 
 
-def test_cost_lookup_handles_unknown_and_outside():
-    grid = geo.CostGrid(np.array([[-1, 50], [100, 0]], dtype=np.int16), 1.0, 0.0, 0.0)
-    assert list(grid.cost([[0.5, 0.5], [1.5, 0.5], [0.5, 1.5], [5.0, 5.0], [-1.0, 0.5]])) == [0, 50, 100, 0, 0]
+def test_order_without_entry_starts_from_the_boat_and_without_exit_heads_for_the_centroid():
+    positions = [[20, 0], [10, 0], [30, 0]]
+    states = [geo.RED, geo.GREEN, geo.RED]
+    assert geo.order_buoys(positions, states, boat=[0, 0]) == [1, 0, 2]
+    assert geo.order_buoys(positions, states, boat=[40, 0]) == [2, 0, 1]
 
 
-def test_snap_moves_a_biased_centre_onto_the_lidar_buoy():
-    grid = grid_with([(1.0, 0.0)])
-    snapped = geo.snap_centre(grid, [0.2, 0.0], 1.0)
-    assert np.linalg.norm(snapped - [1.0, 0.0]) < 0.1
-    # No bias: stays put.
-    assert np.linalg.norm(geo.snap_centre(grid, [1.0, 0.0], 1.0) - [1.0, 0.0]) < 0.1
+def test_order_nearest_next_when_start_and_end_coincide():
+    positions = [[1, 0], [-1, 0], [5, 0]]
+    states = [geo.RED, geo.GREEN, geo.RED]  # centroid (1.67, 0) sits 0.67 m from the boat at (1, 0)
+    assert geo.order_buoys(positions, states, boat=[1.0, 0.0]) == [0, 1, 2]
 
 
-def test_radius_avoids_a_neighbouring_buoy():
-    grid = grid_with([(0.0, 0.0), (0.0, 3.3)])  # neighbour 3.3 m away clips the 3.0 m circle
-    r = geo.choose_radius(grid, [0.0, 0.0], 2.5, 0.5)
-    assert r <= 2.25
-    assert geo.choose_radius(grid_with([(0.0, 0.0)]), [0.0, 0.0], 2.5, 0.5) == 2.5
+def test_nearest_other():
+    np.testing.assert_allclose(geo.nearest_other([[0, 0], [3, 0], [3, 4]]), [3, 3, 4])
+    assert geo.nearest_other([[1, 1]])[0] == math.inf
 
 
-def test_tangent_points_follow_the_direction():
-    # Boat due south at 2R: clockwise (seen from above) heads west first, so it joins on the west side.
-    cw = geo.tangent_point([0, 0], 1.0, [0, -2], clockwise=True)
-    ccw = geo.tangent_point([0, 0], 1.0, [0, -2], clockwise=False)
-    assert cw[0] < 0 < ccw[0]
-    for p in (cw, ccw):
-        assert math.isclose(np.linalg.norm(p), 1.0)
-        assert abs(np.dot(p, np.array([0, -2]) - p)) < 1e-9  # radius is perpendicular to the run in
-    assert np.allclose(geo.tangent_point([0, 0], 2.0, [0, -1], clockwise=True), [0, -2])  # inside: radial
+@pytest.mark.parametrize("sigma", [1, -1])
+def test_circle_points_go_round_in_the_right_direction_with_travel_yaw(sigma):
+    points = geo.circle_points([1.0, 2.0], 2.5, 0.0, sigma, 8, overshoot=1)
+    assert len(points) == 10
+    xy = np.array([p for p, _ in points])
+    np.testing.assert_allclose(np.linalg.norm(xy - [1.0, 2.0], axis=1), 2.5)
+    np.testing.assert_allclose(xy[0], [3.5, 2.0])
+    np.testing.assert_allclose(xy[8], xy[0], atol=1e-9)  # 360 deg, then one more
+    # Clockwise from east goes south first; counterclockwise goes north
+    assert np.sign(xy[1][1] - 2.0) == -sigma
+    for (p, yaw), (q, _) in zip(points, points[1:]):
+        travel = math.atan2(q[1] - p[1], q[0] - p[0])
+        assert abs(math.remainder(travel - yaw, 2 * math.pi)) < math.radians(23)  # chord vs tangent: half a step
 
 
-def test_approach_skips_a_blocked_candidate():
-    grid = grid_with([(0.0, -4.0)])  # obstacle on the ring between the boat and the buoy
-    point = geo.choose_approach(grid, [0, 0], 2.5, 1.5, boat=[0, -10], clockwise=True, threshold=50)
-    assert np.linalg.norm(point) == pytest.approx(4.0)
-    assert grid.cost(point)[0] < 50 and not np.allclose(point, [0, -4])
+def test_start_angle_is_the_tangent_point_ahead_in_the_direction():
+    # Boat due east, 10 m out: clockwise joins south of east, counterclockwise north of east
+    assert geo.start_angle([0, 0], 2.5, [10, 0], 1) < 0 < geo.start_angle([0, 0], 2.5, [10, 0], -1)
+    assert geo.start_angle([0, 0], 2.5, [0, 1], 1) == pytest.approx(math.pi / 2)  # inside: radially
 
 
-def test_waypoint_sample_stays_put_when_clear_and_moves_when_close():
-    gate = grid_with([(-1.5, 0.0), (1.5, 0.0)])
-    assert np.allclose(geo.sample_point(gate, [0.0, 0.0], 1.0), [0.0, 0.0])
-    moved = geo.sample_point(gate, [0.9, 0.0], 1.0)  # biased into the inflation of the right buoy
-    assert gate.cost(moved)[0] < gate.cost([0.9, 0.0])[0] and moved[0] < 0.9
+def test_radius_nominal_on_open_water():
+    assert geo.choose_radius(EMPTY, [0, 0], [], 2.5, 1.6, 0.25, 1.25, 22) == (2.5, "nominal")
 
 
-def test_standoff_sample_never_crosses_its_buoy():
-    # Buoy at origin, travel +y, standoff 1.5 m to the left; nothing may land at x >= 0.
-    grid = grid_with([(0.0, 0.0), (-2.6, 0.0)])
-    for nominal in ([-1.5, 0.0], [-1.5, 0.5], [-1.5, -0.5]):
-        assert geo.sample_point(grid, nominal, 1.0)[0] < 0.0
+def test_radius_capped_by_neighbour_and_floored():
+    r, why = geo.choose_radius(EMPTY, [0, 0], [[3.5, 0], [10, 0]], 2.5, 1.6, 0.25, 1.25, 22)
+    assert r == pytest.approx(2.25) and "neighbour" in why
+    r, why = geo.choose_radius(EMPTY, [0, 0], [[2.0, 0]], 2.5, 1.6, 0.25, 1.25, 22)
+    assert r == 1.6 and "minimum" in why
 
 
-def test_circles_are_one_round_plus_overshoot():
-    assert geo.circle_turn_deg(clockwise=True, overshoot_deg=20.0) == 380.0  # entry
-    assert geo.circle_turn_deg(clockwise=False, overshoot_deg=20.0) == -380.0  # exit
+def test_radius_shrinks_off_a_marked_neighbour_the_drone_missed():
+    grid = grid_with([(0, 0), (2.5, 0)])  # a buoy sitting on the nominal circle
+    r, why = geo.choose_radius(grid, [0, 0], [], 2.5, 1.0, 0.25, 1.25, 22)
+    assert r < 2.5 and "shrunk" in why
+    angles = geo.circle_angles(16)
+    assert grid.cost(np.stack([r * np.cos(angles), r * np.sin(angles)], 1)).max() < 22
 
 
-def test_crossing_direction():
-    assert np.allclose(geo.crossing_direction([0, 0], [0, 4]), [0, 1])
-    assert np.allclose(geo.crossing_direction([1, 1], [1, 1]), [1, 0])
+def test_radius_reports_still_blocked_at_minimum():
+    grid = grid_with([(0, 0), (1.6, 0), (2.0, 0), (2.5, 0)])
+    r, why = geo.choose_radius(grid, [0, 0], [], 2.5, 1.6, 0.25, 1.25, 22)
+    assert r == pytest.approx(1.6) and "still blocked" in why
 
 
-def test_approach_retry_skips_failed_ring_points():
-    kwargs = dict(centre=[0, 0], radius=2.5, offset=1.5, boat=[0, -10], clockwise=True, threshold=50)
-    first = geo.choose_approach(EMPTY, **kwargs)
-    assert np.allclose(geo.choose_approach(EMPTY, exclude=(), **kwargs), first)
-    retry = geo.choose_approach(EMPTY, exclude=[first], exclude_radius=1.0, **kwargs)
-    assert np.linalg.norm(retry) == pytest.approx(4.0)
-    assert np.linalg.norm(retry - first) == pytest.approx(2 * 4.0 * math.sin(math.radians(15)))  # next ring point
-    # Everything excluded: back to the unfiltered choice
-    assert np.allclose(geo.choose_approach(EMPTY, exclude=[[0, 0]], exclude_radius=10.0, **kwargs), first)
-
-
-def test_sample_ahead_of_keeps_the_order():
-    assert np.allclose(geo.sample_point(EMPTY, [0, 0], 0.75, ahead_of=None), [0, 0])
-    ahead = geo.sample_point(EMPTY, [0, 0], 0.75, ahead_of=([0.5, 0.0], [1.0, 0.0], 0.25))
-    assert ahead[0] >= 0.75 - 1e-9
-    # Nothing far enough ahead: falls back to every candidate
-    assert np.allclose(geo.sample_point(EMPTY, [0, 0], 0.75, ahead_of=([5.0, 0.0], [1.0, 0.0], 0.0)), [0, 0])
-
-
-def test_before_middle_after_stay_in_order_across_snapshots():
-    rng = np.random.default_rng(0)
-    lead, radius = 1.0, 0.75
-    d = np.array([1.0, 0.0])
-    sample = lambda grid, xy, ahead_of=None: geo.sample_point(grid, xy, radius, ahead_of=ahead_of)  # noqa: E731
-    for _ in range(200):
-        a, b, c = (grid_with([tuple(rng.uniform(-1.5, 1.5, 2))]) for _ in range(3))  # a new snapshot per leg
-        point = np.zeros(2)
-        before = sample(a, sample(a, point) - lead * d)
-        middle = sample(b, point, (before, d, lead - radius))
-        after = sample(c, middle + lead * d)
-        assert np.dot(before, d) < np.dot(middle, d) < np.dot(after, d)
-
-
-def test_ahead_of_keeps_the_exact_min_gap_candidate():
-    # Worst case: before 0.5 m past the nominal, the only valid middle is the 0.75 m ring point along d (diagonal d
-    # so the dot product rounds)
-    d = np.array([1.0, 1.0]) / math.sqrt(2.0)
-    middle = geo.sample_point(EMPTY, [0, 0], 0.75, ahead_of=(0.5 * d, d, 0.25))
-    assert np.allclose(middle, 0.75 * d)
+def test_lethal_centroid():
+    grid = grid_with([(3.0, 4.0)])
+    np.testing.assert_allclose(geo.lethal_centroid(grid, [3.5, 4.0], 1.0), [3.0, 4.0], atol=0.06)
+    assert geo.lethal_centroid(grid, [10, 10], 1.0) is None
+    assert geo.lethal_centroid(EMPTY, [0, 0], 1.0) is None

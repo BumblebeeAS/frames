@@ -1,50 +1,71 @@
 # RobotX 2026 Task 1 (Safe Passage) on asv5: scripts/safe_passage_node.py, action /asv5/safe_passage.
-# Frames: planning in asv5/map (ENU). Encircle centre goes through convert_to_controls_pose into odom NED.
+# Goal: the drone's buoys (lat/lon + state). Planning in asv5/map (ENU); circles are stop-and-go TrackPath goals.
 safe_passage_node:
   ros__parameters:
     action_name: "/asv5/safe_passage"
-    # Drone's buoy gate manager (pose_estimator), best effort and volatile: only live paths are taken
-    path_topic: "/uav/buoy/safe_passage/path"
-    path_wait_timeout: 30.0
-    # localization cfg/asv5_nav2.yaml: global_costmap in asv5/map, 0.1 m, STVL 25 m range, 5 s decay
+    # Gravity-aligned, base_link, 0.1 m voxel, 0.10..1.00 m above base_link (software-asv-3 asv5 cloud_filter).
+    # The voxel only thins points close in; at range the beam spacing decides how many land on a buoy.
+    cloud_topic: "/asv5/os0/filtered"
     costmap_topic: "/asv5/global_costmap/costmap"
+    incident_topic: "/asv5/task4/incident_active"  # latched Bool from the Task 4 handler
+    marker_topic: "/asv5/safe_passage/markers"
     global_frame_id: "asv5/map"
     base_link_frame_id: "asv5/base_link"
     track_path_action: "/asv5/track_path"
-    encircle_action: "/asv5/in/locomotion/encircle"  # controls' encircle server, not remapped
     from_ll_service: "/asv5/fromLL"
-    convert_to_controls_pose_service: "/asv5/convert_to_controls_pose"
     service_timeout: 2.0
-    # RobotX Task 4: hold while any keep-out zone is active (bb_localization keepout_zones.py)
-    keepout_mask_topic: "/asv5/keepout_mask"
+    tf_timeout: 0.1
 
-    # Circles: R picked from circle_radius +- circle_radius_tol, centre snapped onto lidar-seen lethal cells
+    # Lidar -> landmarks, only inside the field: discs of max_shift_eff + field_crop_margin around every drone buoy
+    cloud_rate: 5.0                # clouds processed per second at most
+    footprint_mask_x: 0.9          # half-length of the own-boat box dropped in base_link (hull 1.16 x 0.90 m)
+    footprint_mask_y: 0.75         # half-width
+    field_crop_margin: 1.5
+    cluster_eps: 0.3               # points closer than this join one cluster
+    cluster_min_points: 3
+    buoy_min_extent: 0.15          # buoy-sized: longest side of the cluster footprint (RoboBuoy ~0.43 m square)
+    buoy_max_extent: 0.9
+    edge_margin: 0.3               # clusters this close to the field edge were cut by it: dropped
+    landmark_assoc_radius: 0.5     # a detection this close updates a landmark instead of starting one
+    landmark_smoothing: 0.3        # fraction of the gap each detection moves its landmark
+    landmark_min_hits: 3           # hits before a landmark is usable
+    landmark_expiry: 60.0          # s unseen before a landmark is dropped
+
+    # Drone-to-lidar shift t: used once shift_min_inliers buoys agree on it
+    max_shift: 4.0
+    shift_spacing_factor: 0.8      # max shift also <= this x the tightest drone buoy spacing (no shift by a whole buoy)
+    shift_inlier_radius: 0.75
+    shift_min_inliers: 3
+
+    # Buoy estimate E_i: nearest unclaimed landmark within r_i of P_i = C_i + t, else costmap lethal cells, else P_i
+    snap_radius: 2.0               # r_i without an accepted shift
+    snap_radius_matched: 1.0       # r_i with one
+    snap_spacing_factor: 0.5       # r_i also <= this x the distance to the nearest other drone buoy
+    claim_radius: 1.0              # landmarks this close to a circled buoy are off limits
+    estimate_move_threshold: 0.3   # remaining circle points move only when E_i moves more than this
+
+    # Circle: start point + circle_points per 360 deg + overshoot
     circle_radius: 2.5
-    circle_radius_tol: 0.5
-    circle_overshoot_deg: 20.0     # sweep past 360 so the circle counts as full
-    snap_radius: 1.0
-    approach_offset: 1.5           # approach ring = R + approach_offset, Encircle joins tangentially from there
-    approach_step_deg: 30.0
-    circle_tolerance: 1.0
-    circle_heading_tolerance: 0.52  # rad
-    circle_max_correction_time: 5
-    circle_timeout: 180.0
-    circle_max_xy_vel: -1.0         # controls default
+    circle_radius_min: 1.6         # tracker cost boundary ~1.05 m from a buoy mark, plus margin
+    circle_radius_step: 0.25
+    neighbour_clearance: 1.25      # R <= nearest other buoy - this (robot radius 0.75 + 0.5)
+    circle_points: 8
+    circle_overshoot_points: 1
+    cost_threshold: 22             # = tracker sample_cost_threshold: a circle point at or above is blocked
 
-    # Pass-through points. sample_radius must stay below the manager's standoff distance.
-    sample_radius: 0.75            # below lead_distance so before < middle < after along the crossing
-    sample_rings: 2
-    sample_per_ring: 8
-    lead_distance: 1.0             # before/after points along the crossing direction, 0 disables
-    cost_threshold: 50             # OccupancyGrid scale: 99 inscribed, 100 lethal
-    check_spacing: 0.2
+    # TrackPath (replan tracker), one goal at a time, specified_heading false, heading along the circle
+    goal_tolerance: 1.0
+    goal_stabilize: 0
+    goal_sample_radius: 0.5        # tracker moves a blocked goal this far; < 0.25 (its sample_spacing) does nothing
+    max_replans: 5
+    goal_timeout: 60.0             # our backstop per goal
 
-    # TrackPath (replan tracker), specified_heading false
-    waypoint_tolerance: 1.0
-    waypoint_stabilize: 0
-    approach_tolerance: 1.0        # below approach_offset so the approach ends outside the circle
-    approach_stabilize: 2
-    max_replans: 5                 # tracker gives up after 6 planning failures in a row, then we resample
-    leg_timeout: 60.0              # per attempt
-    track_retries: 2               # extra attempts per TrackPath movement, each on a fresh snapshot
-    approach_exclude_radius: 1.0   # a retried approach skips ring points this close to a failed one
+    # Retries
+    point_retries: 1               # a failed point is re-placed and retried this many times, then skipped
+    max_consecutive_skips: 2       # skips in a row that fail the attempt (one skip keeps the buoy enclosed)
+    buoy_attempts: 2
+    requeue_failed: true           # failed reds and greens get one more attempt before the exit
+
+    # Task 4 (goal pause_on_incident)
+    preempt_grace: 1.0             # after a goal fails, wait this long for the incident flag before counting it
+    resume_settle: 1.0             # wait after the flag clears, then redo the current buoy

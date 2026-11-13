@@ -1,16 +1,20 @@
-"""Safe Passage sampling on a costmap snapshot, free of ROS so it can be tested offline.
+"""Safe Passage geometry on a costmap snapshot, free of ROS so it can be tested offline.
 
 All positions are 2D in the costmap's global frame (asv5/map, ENU). Angles are ENU: radians, anticlockwise from
-east. Every function degrades to the nominal answer on an empty costmap, and none of them fails: when no candidate
-is under the threshold, the cheapest one is used anyway.
+east. sigma is the circling direction: +1 clockwise seen from above, -1 counterclockwise.
 """
 
 import math
 from dataclasses import dataclass
+from typing import Optional, Sequence
 
 import numpy as np
 
 LETHAL = 100  # nav_msgs/OccupancyGrid scale: 100 lethal, 99 inscribed, -1 unknown
+
+ENTRY, EXIT, RED, GREEN, BLACK = "flashing_blue", "steady_blue", "flashing_red", "flashing_green", "off"
+# Circling direction per state: entry and red clockwise (red stays on starboard), green and exit counterclockwise
+SIGMA = {ENTRY: 1, RED: 1, GREEN: -1, EXIT: -1}
 
 
 @dataclass
@@ -51,10 +55,6 @@ class CostGrid:
         out[inside] = self.data[row[inside], col[inside]]
         return np.maximum(out, 0)
 
-    def max_cost_along(self, points) -> int:
-        points = np.atleast_2d(points)
-        return int(self.cost(points).max()) if len(points) else 0
-
     def lethal_within(self, centre, radius: float) -> np.ndarray:
         """Centres of lethal cells within radius of centre, (n, 2)."""
         rows, cols = np.nonzero(self.data >= LETHAL)
@@ -67,34 +67,56 @@ class CostGrid:
         return xy[np.linalg.norm(xy - np.asarray(centre)[:2], axis=1) <= radius]
 
 
-def segment(a, b, spacing: float) -> np.ndarray:
-    """Points from a to b inclusive, at most spacing apart."""
-    a, b = np.asarray(a, dtype=float)[:2], np.asarray(b, dtype=float)[:2]
-    n = max(1, math.ceil(np.linalg.norm(b - a) / spacing))
-    return a + np.linspace(0.0, 1.0, n + 1)[:, None] * (b - a)
+def lethal_centroid(grid: CostGrid, around, radius: float) -> Optional[np.ndarray]:
+    """Mean of the lethal cells within radius of around (a buoy as the costmap sees it), or None."""
+    cells = grid.lethal_within(around, radius)
+    return cells.mean(axis=0) if len(cells) else None
 
 
-def circle(centre, radius: float, spacing: float) -> np.ndarray:
-    n = max(8, math.ceil(2.0 * math.pi * radius / spacing))
-    angles = np.linspace(0.0, 2.0 * math.pi, n, endpoint=False)
-    return np.asarray(centre, dtype=float)[:2] + radius * np.stack([np.cos(angles), np.sin(angles)], axis=1)
+def order_buoys(positions: Sequence, states: Sequence[str], boat) -> list[int]:
+    """Circling order: the entry, the reds and greens, the exit. Black buoys are left out.
+
+    Reds and greens are sorted by their projection on the line from the start (the entry, else the boat) to the end
+    (the exit, else the reds' and greens' centroid). If start and end coincide they go nearest-next from the start.
+    """
+    positions = [np.asarray(p, dtype=float)[:2] for p in positions]
+    entry = next((i for i, s in enumerate(states) if s == ENTRY), None)
+    exit_ = next((i for i, s in enumerate(states) if s == EXIT), None)
+    middle = [i for i, s in enumerate(states) if s in (RED, GREEN)]
+    start = positions[entry] if entry is not None else np.asarray(boat, dtype=float)[:2]
+    if exit_ is not None:
+        end = positions[exit_]
+    elif middle:
+        end = np.mean([positions[i] for i in middle], axis=0)
+    else:
+        end = start
+    axis = end - start
+    length = float(np.linalg.norm(axis))
+    if length > 1.0:
+        middle.sort(key=lambda i: float(np.dot(positions[i] - start, axis / length)))
+    else:
+        ordered, at = [], start
+        while middle:
+            nearest = min(middle, key=lambda i: float(np.linalg.norm(positions[i] - at)))
+            middle.remove(nearest)
+            ordered.append(nearest)
+            at = positions[nearest]
+        middle = ordered
+    return ([entry] if entry is not None else []) + middle + ([exit_] if exit_ is not None else [])
 
 
-def snap_centre(grid: CostGrid, nominal, radius: float) -> np.ndarray:
-    """Centroid of the lethal cells within radius of nominal (the buoy as the lidar sees it), else nominal."""
-    cells = grid.lethal_within(nominal, radius)
-    return cells.mean(axis=0) if len(cells) else np.asarray(nominal, dtype=float)[:2]
-
-
-def choose_radius(grid: CostGrid, centre, radius: float, tol: float, steps: int = 5, spacing: float = 0.2) -> float:
-    """Radius in [radius - tol, radius + tol] whose circle has the lowest maximum cost, ties to the nearest radius."""
-    candidates = np.linspace(radius - tol, radius + tol, steps) if tol > 0 and steps > 1 else np.array([radius])
-    candidates = candidates[candidates > 0]
-    return float(min(candidates, key=lambda r: (grid.max_cost_along(circle(centre, r, spacing)), abs(r - radius))))
+def nearest_other(points) -> np.ndarray:
+    """Distance from each point to the nearest other point, inf when alone."""
+    points = np.atleast_2d(np.asarray(points, dtype=float))[:, :2]
+    if len(points) < 2:
+        return np.full(len(points), np.inf)
+    d = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
+    np.fill_diagonal(d, np.inf)
+    return d.min(axis=1)
 
 
 def tangent_point(centre, radius: float, start, clockwise: bool) -> np.ndarray:
-    """Where a vehicle at start joins the circle tangentially in the given direction, as controls' Encircle does.
+    """Where a vehicle at start joins the circle tangentially in the given direction.
 
     From inside or on the circle it joins radially, along its bearing from the centre.
     """
@@ -106,67 +128,51 @@ def tangent_point(centre, radius: float, start, clockwise: bool) -> np.ndarray:
     return centre + radius * np.array([math.cos(phi), math.sin(phi)])
 
 
-def _near_any(point: np.ndarray, others, radius: float) -> bool:
-    return any(np.linalg.norm(point - np.asarray(o, dtype=float)[:2]) <= radius for o in others)
+def start_angle(centre, radius: float, boat, sigma: int) -> float:
+    """Bearing from centre of the point the boat joins the circle at: the tangent point, or radially from inside."""
+    point = tangent_point(centre, radius, boat, sigma > 0) - np.asarray(centre, dtype=float)[:2]
+    return math.atan2(point[1], point[0])
 
 
-def choose_approach(grid: CostGrid, centre, radius: float, offset: float, boat, clockwise: bool,
-                    threshold: int, step_deg: float = 30.0, spacing: float = 0.2,
-                    exclude=(), exclude_radius: float = 1.0) -> np.ndarray:
-    """Point on the radius + offset ring to drive to before circling.
+def circle_points(centre, radius: float, phi0: float, sigma: int, n: int, overshoot: int = 0) -> list:
+    """[(xy, yaw), ...] for k = 0 .. n + overshoot: point k at phi0 - sigma * k * 2 pi / n, yaw along the travel."""
+    centre = np.asarray(centre, dtype=float)[:2]
+    out = []
+    for k in range(n + overshoot + 1):
+        phi = phi0 - sigma * k * 2.0 * math.pi / n
+        out.append((centre + radius * np.array([math.cos(phi), math.sin(phi)]), phi - sigma * math.pi / 2.0))
+    return out
 
-    Candidates go round from the boat's bearing to the centre, nearest first. Each is scored on its own cost and the
-    straight run Encircle then makes to its tangent point; the first under threshold wins, else the cheapest.
-    Candidates within exclude_radius of an exclude point (failed targets) are skipped, unless that skips them all.
+
+def circle_angles(n: int, offset: float = 0.0) -> np.ndarray:
+    return offset + np.linspace(0.0, 2.0 * math.pi, n, endpoint=False)
+
+
+def choose_radius(grid: CostGrid, centre, neighbours, nominal: float, minimum: float, step: float,
+                  clearance: float, threshold: int, check_points: int = 16) -> tuple[float, str]:
+    """Circle radius around centre and why.
+
+    Starts at nominal, capped at (nearest neighbour - clearance) and floored at minimum, then shrinks by step while
+    any of check_points evenly spaced points on the circle costs threshold or more, never below minimum.
     """
-    centre, boat = np.asarray(centre, dtype=float)[:2], np.asarray(boat, dtype=float)[:2]
-    ring = radius + offset
-    bearing = math.atan2(*(boat - centre)[::-1]) if np.linalg.norm(boat - centre) > 0 else 0.0
-    steps = max(1, round(360.0 / step_deg))
-    deltas = sorted((math.radians(step_deg) * k for k in range(-(steps // 2), steps - steps // 2)), key=abs)
-    points = [centre + ring * np.array([math.cos(bearing + d), math.sin(bearing + d)]) for d in deltas]
-    allowed = [(d, p) for d, p in zip(deltas, points) if not _near_any(p, exclude, exclude_radius)]
-    scored = []
-    for delta, point in allowed or list(zip(deltas, points)):
-        run = segment(point, tangent_point(centre, radius, point, clockwise), spacing)
-        score = max(grid.max_cost_along(point), grid.max_cost_along(run))
-        if score < threshold:
-            return point
-        scored.append((score, abs(delta), point))
-    return min(scored, key=lambda item: item[:2])[2]
+    centre = np.asarray(centre, dtype=float)[:2]
+    radius, why = nominal, "nominal"
+    neighbours = np.atleast_2d(np.asarray(neighbours, dtype=float)) if len(neighbours) else np.zeros((0, 2))
+    if len(neighbours):
+        nearest = float(np.linalg.norm(neighbours[:, :2] - centre, axis=1).min())
+        if nearest - clearance < radius:
+            radius, why = nearest - clearance, f"neighbour {nearest:.2f} m"
+    if radius < minimum:
+        radius, why = minimum, why + ", floored at minimum"
 
+    def blocked(r):
+        angles = circle_angles(check_points)
+        points = centre + r * np.stack([np.cos(angles), np.sin(angles)], axis=1)
+        return int(grid.cost(points).max()) >= threshold
 
-def sample_point(grid: CostGrid, nominal, radius: float, rings: int = 2, per_ring: int = 8,
-                 ahead_of=None) -> np.ndarray:
-    """Cheapest of nominal and rings of candidates within radius, ties to the nearest to nominal.
-
-    Keep radius below the standoff distance so a standoff sample stays on its side of the buoy.
-    ahead_of=(point, direction, min_gap) keeps only candidates at least min_gap past point along the unit direction,
-    unless none are.
-    """
-    nominal = np.asarray(nominal, dtype=float)[:2]
-    candidates = [nominal]
-    for k in range(1, rings + 1):
-        r = radius * k / rings
-        candidates += [nominal + r * np.array([math.cos(a), math.sin(a)])
-                       for a in np.linspace(0.0, 2.0 * math.pi, per_ring, endpoint=False)]
-    if ahead_of is not None:
-        point, direction, min_gap = ahead_of
-        point, direction = np.asarray(point, dtype=float)[:2], np.asarray(direction, dtype=float)[:2]
-        # 1e-9: the worst case lands exactly on min_gap
-        candidates = [c for c in candidates if np.dot(c - point, direction) >= min_gap - 1e-9] or candidates
-    costs = grid.cost(np.array(candidates))
-    best = min(range(len(candidates)), key=lambda i: (costs[i], np.linalg.norm(candidates[i] - nominal)))
-    return candidates[best]
-
-
-def crossing_direction(previous, following) -> np.ndarray:
-    """Unit direction to cross a pass-through point: from the point before it to the point after it."""
-    d = np.asarray(following, dtype=float)[:2] - np.asarray(previous, dtype=float)[:2]
-    n = float(np.linalg.norm(d))
-    return d / n if n > 1e-6 else np.array([1.0, 0.0])
-
-
-def circle_turn_deg(clockwise: bool, overshoot_deg: float) -> float:
-    """One full round plus overshoot, in controls' Encircle convention: positive clockwise seen from above."""
-    return (1.0 if clockwise else -1.0) * (360.0 + overshoot_deg)
+    while blocked(radius):
+        if radius <= minimum + 1e-9:
+            return radius, why + ", still blocked at minimum"
+        radius = max(radius - step, minimum)
+        why += f", shrunk to {radius:.2f} m for cost"
+    return radius, why

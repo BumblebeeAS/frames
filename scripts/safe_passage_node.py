@@ -23,7 +23,10 @@ Task 4 Core: with respond_to_assistance, an AssistanceRequest for this vehicle t
 doing. The node sends the IncidentAck and switches the heartbeat task, drives to the requested position, sends the
 ReadinessReport once there, and holds (the boat station-keeps without a goal) until the ReadinessConfirm naming that
 report arrives or readiness_confirm_timeout passes. Then it switches the task back and the interrupted buoy starts
-over from TRANSIT. Requests are taken once per seq, only while a goal runs; a newer request replaces the one in hand.
+over from TRANSIT. Requests are taken once per seq; a newer request replaces the one in hand. A request that
+arrives while no goal answers them is held, with no time limit, and answered first by the next goal that does. The
+clear_assistance service (std_srvs/Trigger) drops a held request: the mission tree calls it at run start, so nothing
+from before the run is acted on. The hold is in memory only, so a relaunched node starts without one.
 
 Conventions: everything is planned in global_frame_id (asv5/map, ENU). TrackPath goals are GOAL_POSE there with
 specified_heading false and the heading along the circle, so the boat ends each point facing the next.
@@ -53,6 +56,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from rclpy.time import Time as RosTime
 from robot_localization.srv import FromLL
 from std_msgs.msg import ColorRGBA
+from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
 from frames.utils import buoy_align as ba
@@ -163,6 +167,7 @@ class SafePassageNode(Node):
         self.requeue_failed = param("requeue_failed", True)
 
         # Task 4 Core
+        self.hold_idle_requests = param("hold_idle_requests", True)
         self.readiness_confirm_timeout = param("readiness_confirm_timeout", 900.0)
         self.incident_goal_retries = param("incident_goal_retries", 2)
         self.incident_sample_radius = param("incident_sample_radius", 0.5)
@@ -199,10 +204,11 @@ class SafePassageNode(Node):
         self._circle: list = []      # [(xy, yaw)] being driven, for markers
         self._target: Optional[np.ndarray] = None
         self._logged_t = np.zeros(2)
-        # Task 4 Core, all under _lock. A request moves _pending -> _incident -> _incidents and never back.
+        # Task 4 Core, all under _lock. A request moves (_held ->) _pending -> _incident -> ended and never back.
         self._respond = False                         # the running goal answers AssistanceRequests
         self._seen: set[int] = set()                  # request seqs taken or turned down by the running goal
         self._task_wanted: Optional[str] = None       # the heartbeat task last asked for: older sends give way
+        self._held: Optional[Incident] = None         # arrived with no goal answering: kept until one does, or cleared
         self._pending: Optional[Incident] = None      # accepted, not yet picked up by the goal thread
         self._incident: Optional[Incident] = None     # being answered
         self._incidents: list[Incident] = []          # of the running goal, in order, for its result
@@ -218,6 +224,8 @@ class SafePassageNode(Node):
         self.readiness = ActionClient(self, SendReadinessReport, self.readiness_name, callback_group=self.cb_group)
         self.set_task_name = param("set_task_action", "/asv5/set_task")
         self.set_task = ActionClient(self, SetTask, self.set_task_name, callback_group=self.cb_group)
+        self.create_service(Trigger, param("clear_assistance_service", "/asv5/safe_passage/clear_assistance"),
+                            self._on_clear_assistance, callback_group=self.cb_group)
 
         self._busy = threading.Lock()
         self.server = ActionServer(
@@ -271,6 +279,13 @@ class SafePassageNode(Node):
         with self._lock:
             self._respond, self._incidents, self._confirms = bool(request.respond_to_assistance), [], {}
             self._seen = set()  # per goal: RoboCommand may number its commands from 1 again in another run
+            if self._respond and self._held is not None:
+                held, self._held = self._held, None
+                self._seen.add(held.seq)
+                self._pending = held
+                self._incidents.append(held)
+                self.get_logger().warning(f"Assistance request {held.seq}, held for "
+                                          f"{time.monotonic() - held.received:.0f} s, is answered first")
         buoys = []
         for i, b in enumerate(request.buoys):
             xy = self._from_ll(b.position.latitude, b.position.longitude)
@@ -286,6 +301,7 @@ class SafePassageNode(Node):
         self.get_logger().info(
             "Safe Passage buoys: " + ", ".join(f"{b.index}:{b.state}({b.xy[0]:.1f},{b.xy[1]:.1f})" for b in buoys)
             + f"; tightest spacing {float(aligner.nn.min()):.2f} m; respond_to_assistance {self._respond}")
+        self._answer_assistance(goal_handle, len(buoys))  # a request held from before this goal comes first
         while True:
             try:
                 self._align(goal_handle, len(buoys))
@@ -544,8 +560,17 @@ class SafePassageNode(Node):
         with self._lock:
             where = f"({msg.position.latitude:.7f}, {msg.position.longitude:.7f})"
             if not self._respond:
-                self.get_logger().warning(f"Assistance request {msg.seq} to {where} ignored: no Safe Passage goal "
-                                          "answering requests is running", throttle_duration_sec=1.0)
+                if msg.vehicle_type != self.vehicle_type or not self.hold_idle_requests:
+                    self.get_logger().info(f"Assistance request {msg.seq} to {where} for '{msg.vehicle_type}' "
+                                           "dropped: no Safe Passage goal answering requests is running")
+                    return
+                if self._held is not None and self._held.seq == msg.seq:
+                    return
+                replaced = f", replacing request {self._held.seq}" if self._held is not None else ""
+                self._held = Incident(msg.seq, msg.position.latitude, msg.position.longitude, time.monotonic())
+                self.get_logger().warning(f"Assistance request {msg.seq} to {where} held{replaced}: no Safe Passage "
+                                          "goal answering requests is running. The next one answers it first, "
+                                          "unless clear_assistance is called before")
                 return
             if msg.seq in self._seen:  # each request once per goal, however often it is delivered
                 return
@@ -559,6 +584,19 @@ class SafePassageNode(Node):
             self._pending = Incident(msg.seq, msg.position.latitude, msg.position.longitude, time.monotonic())
             self._incidents.append(self._pending)
             self.get_logger().warning(f"Assistance request {msg.seq} to {where}: accepted, interrupting")
+
+    def _on_clear_assistance(self, request, response):
+        """Drop a held request (a new run starts). A request a running goal is answering is not touched."""
+        with self._lock:
+            held, self._held = self._held, None
+            busy = self._pending or self._incident
+        response.success = True
+        response.message = (f"dropped held assistance request {held.seq}" if held is not None
+                            else "no assistance request was held")
+        if busy is not None:
+            response.message += f"; request {busy.seq} is being answered by the running goal and goes on"
+        self.get_logger().info(f"clear_assistance: {response.message}")
+        return response
 
     def _on_confirm(self, msg: ReadinessConfirm):
         if msg.vehicle_id != self.vehicle_id:

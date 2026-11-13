@@ -230,11 +230,62 @@ def test_request_is_ignored_when_the_goal_does_not_ask_for_it(node):
     assert h.run()[0] and h.acks == [] and "INCIDENT_TRANSIT" not in h.phases()
 
 
-def test_request_with_no_goal_running_is_dropped(node):
-    node._on_assistance(assistance(seq=30))               # nothing running: dropped, nothing kept
-    assert node._pending is None and node._incidents == [] and node._seen == set()
+def clear(node):
+    from std_srvs.srv import Trigger
+    return node._on_clear_assistance(Trigger.Request(), Trigger.Response())
+
+
+def test_request_with_no_goal_running_is_held_and_answered_first_by_the_next_goal(node):
+    node._on_assistance(assistance(seq=30))               # nothing running: held, however long
+    node._held.received -= 3600.0                         # an hour ago: no time limit
+    assert node._pending is None and node._held.seq == 30
     h = Harness(node, [buoy("flashing_red", [0, 0])], respond=True)
-    assert h.run()[0] and h.acks == [] and "assistance" not in h.run()[3]
+    later(0.2, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 1 and "assistance request 30 confirmed after 36" in message
+    assert h.acks == [30] and h.reports == [30] and node._held is None
+    np.testing.assert_allclose(h.targets[0], STATION)     # before anything else, ALIGN included
+    assert h.phases()[0] == "INCIDENT_TRANSIT"
+
+
+def test_clear_assistance_drops_a_held_request(node):
+    node._on_assistance(assistance(seq=30))
+    response = clear(node)
+    assert response.success and "dropped held assistance request 30" in response.message and node._held is None
+    assert "no assistance request was held" in clear(node).message
+    h = Harness(node, [buoy("flashing_red", [0, 0])], respond=True)
+    ok, circled, failed, message = h.run()
+    assert ok and h.acks == [] and "assistance" not in message
+
+
+def test_clear_assistance_leaves_a_request_being_answered(node):
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node)], respond=True)
+    cleared = []
+    later(0.15, lambda: cleared.append(clear(node).message))
+    later(0.3, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and "assistance request 30 confirmed" in message
+    assert "request 30 is being answered" in cleared[0]
+
+
+def test_only_the_newest_idle_request_for_us_is_held(node):
+    node._on_assistance(assistance(seq=30))
+    node._on_assistance(assistance(seq=31, vehicle_type="uuv"))   # not ours: never held
+    assert node._held.seq == 30
+    node._on_assistance(assistance(seq=32, xy=[-20.0, -9.0]))
+    assert node._held.seq == 32 and node._held.latitude == -20.0
+
+
+def test_goal_that_does_not_answer_requests_leaves_the_held_one(node):
+    node._on_assistance(assistance(seq=30))
+    h = Harness(node, [buoy("flashing_red", [0, 0])])     # respond_to_assistance false
+    assert h.run()[0] and h.acks == [] and node._held.seq == 30
+
+
+def test_holding_can_be_switched_off(node):
+    node.hold_idle_requests = False
+    node._on_assistance(assistance(seq=30))
+    assert node._held is None
 
 
 def test_seq_can_come_again_in_another_goal(node):

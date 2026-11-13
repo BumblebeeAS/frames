@@ -66,6 +66,8 @@ safe_passage_node:
     # Task 4 Core (goal respond_to_assistance): an AssistanceRequest for this vehicle type interrupts the goal.
     # IncidentAck + SetTask go out, the boat drives to the position, sends the ReadinessReport, holds for the
     # ReadinessConfirm naming that report, then SetTask back and the interrupted buoy starts over.
+    hold_idle_requests: true       # a request with no goal answering is held, with no time limit, for the next goal
+    clear_assistance_service: "/asv5/safe_passage/clear_assistance"  # Trigger: drops it (the tree, at run start)
     vehicle_id: "USV1"             # as the OCS names this vehicle: ReadinessConfirms for another id are ignored
     vehicle_type: "usv"            # AssistanceRequests for another type are ignored
     assistance_topic: "/asv5/task4/assistance_request"        # from the OCS bridge, not latched

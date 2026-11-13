@@ -540,8 +540,15 @@ class SafePassageNode(Node):
                 self.global_frame_id, msg.header.frame_id, RosTime.from_msg(msg.header.stamp),
                 Duration(seconds=self.tf_timeout)).transform
         except tf2_ros.TransformException as e:
-            self.get_logger().warning(f"Cloud skipped, no transform: {e}", throttle_duration_sec=5.0)
-            return
+            # TF behind the cloud (seen on asv5): the latest transform is off by the lag, still worth a cloud
+            try:
+                transform = self.tf_buffer.lookup_transform(
+                    self.global_frame_id, msg.header.frame_id, RosTime()).transform
+            except tf2_ros.TransformException:
+                self.get_logger().warning(f"Cloud skipped, no transform: {e}", throttle_duration_sec=5.0)
+                return
+            self.get_logger().warning(f"Cloud transformed with the latest TF, none at its stamp: {e}",
+                                      throttle_duration_sec=5.0)
         t = transform.translation
         xy = (points @ quaternion_matrix(transform.rotation).T + [t.x, t.y, t.z])[:, :2]
         stamp = self.get_clock().now().nanoseconds * 1e-9

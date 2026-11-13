@@ -255,3 +255,34 @@ def test_cloud_feeds_landmarks_and_moves_the_circle_onto_them(node):
     assert np.linalg.norm(estimate.xy - [truth[0] - 0.2, 0.0]) < 0.05  # the visible face
     node._publish_markers()  # must not raise
     node._field, node._buoys = None, []
+
+
+def test_cloud_falls_back_to_the_latest_transform_when_tf_lags(node):
+    import tf2_ros
+    from sensor_msgs.msg import PointField
+    from sensor_msgs_py.point_cloud2 import create_cloud
+    from std_msgs.msg import Header
+    from frames.utils import buoy_field as bf
+
+    node._field = bf.BuoyField([[10.0, 0.0]], node.field_params)
+    node.base_link_frame_id = "asv5/base_link"
+    identity = SimpleNamespace(transform=SimpleNamespace(
+        translation=SimpleNamespace(x=0.0, y=0.0, z=0.0), rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)))
+    asked = []
+
+    def lookup(target, source, when, timeout=None):
+        asked.append(when.nanoseconds)
+        if when.nanoseconds:  # at the cloud stamp: TF has not caught up
+            raise tf2_ros.ExtrapolationException("would require extrapolation into the future")
+        return identity
+    node.tf_buffer.lookup_transform = lookup
+    face = np.stack([np.full(8, 9.8), np.linspace(-0.2, 0.2, 8), np.full(8, 0.2)], 1)
+    fields = [PointField(name=n, offset=4 * i, datatype=PointField.FLOAT32, count=1) for i, n in enumerate("xyz")]
+    header = Header(frame_id="asv5/base_link")
+    header.stamp.sec = 100
+    for _ in range(3):
+        node._last_cloud = 0.0
+        node._on_cloud(create_cloud(header, fields, face.tolist()))
+    assert asked[:2] == [100 * 10**9, 0]  # stamp first, then latest
+    assert len(node._field.usable()) == 1
+    node._field = None

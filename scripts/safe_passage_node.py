@@ -159,6 +159,7 @@ class SafePassageNode(Node):
         self.incident_goal_retries = param("incident_goal_retries", 2)
         self.incident_sample_radius = param("incident_sample_radius", 0.5)
         self.incident_tolerance = param("incident_tolerance", 1.0)
+        self.incident_goal_timeout = param("incident_goal_timeout", 300.0)  # the station can be across the course
         self.report_retries = param("report_retries", 3)
         self.report_timeout = param("report_timeout", 40.0)   # the bridge gives the OCS 30 s
         self.incident_task = param("incident_task", "dynamic_incident")
@@ -191,7 +192,8 @@ class SafePassageNode(Node):
         self._logged_t = np.zeros(2)
         # Task 4 Core, all under _lock. A request moves _pending -> _incident -> _incidents and never back.
         self._respond = False                         # the running goal answers AssistanceRequests
-        self._seen: set[int] = set()                  # every request seq taken or turned down, for the node's life
+        self._seen: set[int] = set()                  # request seqs taken or turned down by the running goal
+        self._task_wanted: Optional[str] = None       # the heartbeat task last asked for: older sends give way
         self._pending: Optional[Incident] = None      # accepted, not yet picked up by the goal thread
         self._incident: Optional[Incident] = None     # being answered
         self._incidents: list[Incident] = []          # of the running goal, in order, for its result
@@ -241,6 +243,7 @@ class SafePassageNode(Node):
                 with self._lock:
                     self._aligner, self._buoys, self._circle, self._target = None, [], [], None
                     self._respond = False
+                    self._task_wanted = None  # a task switch still being retried stops: the tree owns the task again
                     for incident in (self._pending, self._incident):
                         if incident is not None and incident.ended is None:
                             self._end(incident, "canceled")
@@ -258,6 +261,7 @@ class SafePassageNode(Node):
         request = goal_handle.request
         with self._lock:
             self._respond, self._incidents, self._confirms = bool(request.respond_to_assistance), [], {}
+            self._seen = set()  # per goal: RoboCommand may number its commands from 1 again in another run
         buoys = []
         for i, b in enumerate(request.buoys):
             xy = self._from_ll(b.position.latitude, b.position.longitude)
@@ -473,7 +477,7 @@ class SafePassageNode(Node):
     # Driving
 
     def _drive(self, goal_handle, xy, yaw: float, label: str, sample_radius: Optional[float] = None,
-               tolerance: Optional[float] = None) -> bool:
+               tolerance: Optional[float] = None, timeout: Optional[float] = None) -> bool:
         """TrackPath to xy, ending at yaw (ENU). Raises Assistance or Canceled."""
         self._check(goal_handle)
         with self._lock:
@@ -498,7 +502,8 @@ class SafePassageNode(Node):
         goal.depth_tolerance = 1.0  # must stay positive, controls compares strictly
         goal.stabilize_duration = int(self.goal_stabilize)
         self.get_logger().info(f"{label}: TrackPath to ({xy[0]:.2f}, {xy[1]:.2f}) heading {math.degrees(yaw):.0f}")
-        return self._run_action(goal_handle, self.track_path, self.track_path_name, goal, self.goal_timeout,
+        return self._run_action(goal_handle, self.track_path, self.track_path_name, goal,
+                                self.goal_timeout if timeout is None else timeout,
                                 lambda r: r.status == TrackPath.Result.STATUS_SUCCESS)
 
     # Task 4 Core
@@ -506,17 +511,17 @@ class SafePassageNode(Node):
     def _on_assistance(self, msg: AssistanceRequest):
         """Accept a request once per seq, only for this vehicle type and while a goal answers them."""
         with self._lock:
-            if msg.seq in self._seen:  # each request once, however often it is delivered
+            where = f"({msg.position.latitude:.7f}, {msg.position.longitude:.7f})"
+            if not self._respond:
+                self.get_logger().warning(f"Assistance request {msg.seq} to {where} ignored: no Safe Passage goal "
+                                          "answering requests is running", throttle_duration_sec=1.0)
+                return
+            if msg.seq in self._seen:  # each request once per goal, however often it is delivered
                 return
             self._seen.add(msg.seq)
-            where = f"({msg.position.latitude:.7f}, {msg.position.longitude:.7f})"
             if msg.vehicle_type != self.vehicle_type:
                 self.get_logger().info(f"Assistance request {msg.seq} to {where} is for '{msg.vehicle_type}', not "
                                        f"'{self.vehicle_type}': ignored")
-                return
-            if not self._respond:
-                self.get_logger().warning(f"Assistance request {msg.seq} to {where} ignored: no Safe Passage goal "
-                                          "answering requests is running. It stays ignored")
                 return
             if self._pending is not None:
                 self._end(self._pending, "superseded")
@@ -563,7 +568,8 @@ class SafePassageNode(Node):
             else:
                 self.get_logger().warning(f"Assistance request {incident.seq}: {outcome} after {took:.0f} s")
         if answered:
-            self._send_task(self.resume_task)
+            # Waited for, so it cannot land after a task the mission tree sets once this goal returns
+            self._send_task(self.resume_task, goal_handle)
             self.get_logger().info("Back to Safe Passage: the interrupted step starts over")
 
     def _respond_to(self, goal_handle, incident: Incident, total: int) -> str:
@@ -587,7 +593,7 @@ class SafePassageNode(Node):
             boat = self._boat_xy()
             yaw = math.atan2(station[1] - boat[1], station[0] - boat[0]) if boat is not None else 0.0
             if self._drive(goal_handle, station, yaw, f"Assistance request {seq} transit {attempt}/{tries}",
-                           self.incident_sample_radius, self.incident_tolerance):
+                           self.incident_sample_radius, self.incident_tolerance, self.incident_goal_timeout):
                 break
         else:
             self.get_logger().error(f"Assistance request {seq}: position ({station[0]:.2f}, {station[1]:.2f}) not "
@@ -616,10 +622,20 @@ class SafePassageNode(Node):
     def _send_incident_ack(self, seq: int):
         goal = SendIncidentAck.Goal()
         goal.report.command_seq = seq
-        self._send_in_background(self.incident_ack, self.incident_ack_name, goal, f"IncidentAck for {seq}")
+        self._send_with_retries(self.incident_ack, self.incident_ack_name, goal, f"IncidentAck for {seq}",
+                                lambda: False, background=True)
 
-    def _send_task(self, task: str):
-        self._send_in_background(self.set_task, self.set_task_name, SetTask.Goal(task=task), f"SetTask {task}")
+    def _send_task(self, task: str, goal_handle=None):
+        """Switch the heartbeat task. In the background, or waited for when goal_handle is given (cancel ends the
+        wait). A switch gives way as soon as a newer one is asked for, so they cannot land out of order."""
+        with self._lock:
+            self._task_wanted = task
+
+        def stale():
+            return self._task_wanted != task or (goal_handle is not None and goal_handle.is_cancel_requested)
+
+        self._send_with_retries(self.set_task, self.set_task_name, SetTask.Goal(task=task), f"SetTask {task}",
+                                stale, background=goal_handle is None)
 
     def _send_readiness(self, goal_handle, seq: int) -> Optional[int]:
         """Send the ReadinessReport, retried; returns the seq of the report that carried it."""
@@ -637,20 +653,38 @@ class SafePassageNode(Node):
             self.get_logger().warning(f"ReadinessReport for {seq}: attempt {attempt} failed")
         return None
 
-    def _send_in_background(self, client: ActionClient, name: str, goal, what: str):
-        """Send a report-style goal without holding up the boat: retried, every outcome logged."""
-        def run():
-            for attempt in range(1, 2 + max(0, int(self.report_retries))):
-                error = self._send_blocking(client, goal)
-                if error is None:
-                    self.get_logger().info(f"{what}: sent")
-                    return
-                self.get_logger().warning(f"{what}: attempt {attempt} failed ({error})")
-                time.sleep(1.0)
-            self.get_logger().error(f"{what}: not sent")
-        threading.Thread(target=run, name=what, daemon=True).start()
+    def _send_with_retries(self, client: ActionClient, name: str, goal, what: str, stale: Callable[[], bool],
+                           background: bool):
+        """Send a report-style goal, retried, every outcome logged. Gives up as soon as stale() holds."""
+        last = 1 + max(0, int(self.report_retries))
 
-    def _send_blocking(self, client: ActionClient, goal) -> Optional[str]:
+        def attempt(n: int) -> bool:
+            """True when there is nothing left to do: sent, or no longer wanted."""
+            if stale():
+                self.get_logger().info(f"{what}: dropped, no longer wanted")
+                return True
+            error = self._send_blocking(client, goal, stale)
+            if error is None:
+                self.get_logger().info(f"{what}: sent")
+                return True
+            self.get_logger().warning(f"{what}: attempt {n}/{last} failed ({error})")
+            return False
+
+        def run(first: int):
+            for n in range(first, last + 1):
+                if n > 1:
+                    time.sleep(1.0)
+                if attempt(n):
+                    return
+            self.get_logger().error(f"{what}: not sent")
+
+        if background:
+            threading.Thread(target=run, args=(1,), name=what, daemon=True).start()
+        elif not attempt(1):
+            # Waited for one try only, so a dead OCS link cannot hold the boat; the retries go on behind
+            threading.Thread(target=run, args=(2,), name=what, daemon=True).start()
+
+    def _send_blocking(self, client: ActionClient, goal, stale: Callable[[], bool] = lambda: False) -> Optional[str]:
         """Send a goal and wait for its result on events (the executor runs the callbacks). None when it went out."""
         if not client.wait_for_server(timeout_sec=self.service_timeout):
             return "server unavailable"
@@ -661,8 +695,13 @@ class SafePassageNode(Node):
             return "goal not accepted"
         result = send.result().get_result_async()
         result.add_done_callback(lambda _: done.set())
-        if not done.wait(self.report_timeout):
-            return f"no result within {self.report_timeout:.0f} s"
+        deadline = time.monotonic() + self.report_timeout
+        while not done.wait(0.1):
+            if stale():
+                send.result().cancel_goal_async()
+                return "no longer wanted"
+            if time.monotonic() > deadline:
+                return f"no result within {self.report_timeout:.0f} s"
         return result.result().result.error or None
 
     # Plumbing

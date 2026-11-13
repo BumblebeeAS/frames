@@ -61,7 +61,7 @@ class Harness:
         self.node, self.goal = node, Goal(buoys, respond)
         self.acks, self.tasks, self.reports, self.report_seq = [], [], [], 412
         node._send_incident_ack = self.acks.append
-        node._send_task = self.tasks.append
+        node._send_task = lambda task, goal_handle=None: self.tasks.append(task)
         node._send_readiness = lambda gh, seq: (self.reports.append(seq), self.report_seq)[1]
         self.results, self.boat, self.targets = list(results), np.array(boat), []
         node._boat_xy = lambda: self.boat
@@ -228,10 +228,69 @@ def test_request_is_ignored_when_the_goal_does_not_ask_for_it(node):
     assert h.run()[0] and h.acks == [] and "INCIDENT_TRANSIT" not in h.phases()
 
 
-def test_request_before_a_goal_stays_ignored_when_repeated_during_one(node):
-    node._on_assistance(assistance(seq=30))               # nothing running: turned down
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node, seq=30)], respond=True)
-    assert h.run()[0] and h.acks == [] and node._incidents == []
+def test_request_with_no_goal_running_is_dropped(node):
+    node._on_assistance(assistance(seq=30))               # nothing running: dropped, nothing kept
+    assert node._pending is None and node._incidents == [] and node._seen == set()
+    h = Harness(node, [buoy("flashing_red", [0, 0])], respond=True)
+    assert h.run()[0] and h.acks == [] and "assistance" not in h.run()[3]
+
+
+def test_seq_can_come_again_in_another_goal(node):
+    """RoboCommand may number from 1 again in the next run: the node must not turn that request down."""
+    for _ in range(2):
+        h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node, seq=1)], respond=True)
+        later(0.2, node._on_confirm, confirm())
+        ok, circled, failed, message = h.run()
+        assert ok and h.acks == [1] and "assistance request 1 confirmed" in message
+        node._respond = False                             # as _execute leaves it when a goal ends
+
+
+def test_incident_transit_gets_its_own_goal_timeout(node):
+    timeouts = []
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node)], respond=True)
+    inner = node._run_action
+    node._run_action = lambda gh, client, name, goal, timeout, ok: (timeouts.append(timeout),
+                                                                    inner(gh, client, name, goal, timeout, ok))[1]
+    later(0.2, node._on_confirm, confirm())
+    assert h.run()[0]
+    assert timeouts[1] == node.goal_timeout and timeouts[2] == node.incident_goal_timeout == 300.0
+
+
+def test_older_task_switch_gives_way_to_a_newer_one(node):
+    """SetTask dynamic_incident still being retried must not land after the switch back to safe_passage."""
+    sent, release = [], threading.Event()
+
+    def send_blocking(client, goal, stale=lambda: False):
+        if goal.task == "dynamic_incident":
+            release.wait(2.0)                             # the OCS is slow to answer this one
+            return "no heartbeat"                         # ... and it fails: a retry would follow
+        sent.append(goal.task)
+        return None
+
+    node._send_blocking = send_blocking
+    node._send_task("dynamic_incident")                   # background, stuck
+    node._send_task("safe_passage", Goal([]))             # the switch back, waited for
+    release.set()
+    time.sleep(1.5)                                       # the retry pause of the first one
+    assert sent == ["safe_passage"]
+
+
+def test_waited_task_switch_tries_once_then_retries_behind(node):
+    """The switch back is waited for, but a dead OCS link must not hold the boat for every retry."""
+    calls = []
+
+    def send_blocking(client, goal, stale=lambda: False):
+        calls.append(time.monotonic())
+        return "server unavailable" if len(calls) < 3 else None
+
+    node._send_blocking = send_blocking
+    started = time.monotonic()
+    node._send_task("safe_passage", Goal([]))
+    assert len(calls) == 1 and time.monotonic() - started < 0.5   # returned after the first try
+    deadline = time.monotonic() + 5.0
+    while len(calls) < 3 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(calls) == 3                                        # and it still got through
 
 
 def test_repeated_request_is_answered_once(node):

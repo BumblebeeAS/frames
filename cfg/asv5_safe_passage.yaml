@@ -75,6 +75,7 @@ safe_passage_node:
     resume_task: "safe_passage"         # and after
     incident_sample_radius: 0.5    # the tracker may move a blocked station this far
     incident_tolerance: 1.0        # on station within this of the requested position
+    incident_goal_timeout: 300.0   # per try at reaching it (goal_timeout is sized for circle points)
     incident_goal_retries: 2       # more tries at reaching it; unreached: no ReadinessReport, back to the buoys
     readiness_confirm_timeout: 900.0   # hold this long for the ReadinessConfirm, then resume anyway
     report_retries: 3              # more tries for IncidentAck, SetTask and ReadinessReport

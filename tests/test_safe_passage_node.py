@@ -715,3 +715,21 @@ def test_restart_after_an_incident_keeps_the_blob_a_costmap_misses(node):
     per = goals(node)
     radii = np.linalg.norm(np.array(h.targets[-per:]) - truth, axis=1)
     assert radii.max() - radii.min() < 0.15, radii              # the whole restarted circle is around the blob
+
+
+def test_unknown_buoys_are_dropped_and_take_no_part_in_the_alignment(node):
+    h = Harness(node, [buoy("unknown", [3.0, 3.0]), buoy("flashing_red", [0.0, 0.0]), buoy("", [5.0, 5.0]),
+                       buoy("off", [8.0, 0.0])])
+    seen = []
+    drive = node._drive
+    node._drive = lambda *a, **k: (seen.append(node._aligner.candidates.copy()), drive(*a, **k))[1]
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 1 and "unknown" not in message
+    np.testing.assert_allclose(seen[0], [[0.0, 0.0], [8.0, 0.0]])    # the red and the black only
+    assert goal_rejected_without_known_buoys(node)
+
+
+def goal_rejected_without_known_buoys(node):
+    from rclpy.action import GoalResponse
+    request = SimpleNamespace(buoys=[buoy("unknown", [0.0, 0.0]), buoy("off", [1.0, 1.0])])
+    return node._on_goal(request) == GoalResponse.REJECT

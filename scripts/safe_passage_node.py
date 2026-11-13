@@ -2,7 +2,8 @@
 """RobotX 2026 Task 1 (Safe Passage) on the ASV, from the drone's classified buoys.
 
 Serves bb_robotx_msgs/SafePassage. A goal carries the drone's buoys (lat/lon + state). They are converted once to
-the global frame with fromLL, ordered (entry, reds and greens along the course, exit; blacks are never circled), and
+the global frame with fromLL, ordered (entry, reds and greens along the course, exit; blacks are never circled, and
+buoys in any other state, such as unknown, are dropped on arrival and take no part in the alignment either), and
 circled one at a time with stop-and-go TrackPath goals:
 
   TRANSIT  TrackPath to p0, where the boat joins the circle tangentially in the buoy's direction
@@ -290,7 +291,12 @@ class SafePassageNode(Node):
                 self.get_logger().warning(f"Assistance request {held.seq}, held for "
                                           f"{time.monotonic() - held.received:.0f} s, is answered first")
         buoys = []
+        known = (geo.ENTRY, geo.EXIT, geo.RED, geo.GREEN, geo.BLACK)
         for i, b in enumerate(request.buoys):
+            if b.state not in known:
+                # An unclassified detection may not be a buoy at all: it is not circled and not aligned on either
+                self.get_logger().info(f"Buoy {i} ({b.state or 'no state'}): not a known state, dropped")
+                continue
             xy = self._from_ll(b.position.latitude, b.position.longitude)
             if xy is None:
                 self.get_logger().error(f"Buoy {i} ({b.state}): fromLL failed, dropped")

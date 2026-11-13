@@ -38,7 +38,7 @@ specified_heading false and the heading of the next leg, so the boat ends each g
 import math
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Optional
 
 import numpy as np
@@ -219,6 +219,7 @@ class SafePassageNode(Node):
         self._target: Optional[np.ndarray] = None
         self._logged_t = np.zeros(2)
         self._route_buoys: list = []                  # what the route in hand was planned on (safe_route.Buoy)
+        self._route_level = 0                         # ... and the planner's margin level that produced it
         self._tracker: Optional[sr.PassTracker] = None  # set while passes count, fed the boat's pose by a timer
         # Task 4 Core, all under _lock. A request moves (_held ->) _pending -> _incident -> ended and never back.
         self._respond = False                         # the running goal answers AssistanceRequests
@@ -470,6 +471,7 @@ class SafePassageNode(Node):
                     if plan.goals or (start is not None and plan.status == "missing_exit"):  # the latter: all done
                         with self._lock:
                             self._route_buoys = inputs
+                            self._route_level = max(plan.level, 0)
                             self._circle = [(np.array(g[:2]), g[2]) for g in plan.goals]
                         return plan
             self._wait(goal_handle, lambda: self._check(goal_handle) or False, self.plan_retry_period)
@@ -563,7 +565,11 @@ class SafePassageNode(Node):
         with self._lock:
             tracker, self._tracker = self._tracker, None
             if on:
-                self._tracker = tracker or sr.PassTracker(self._route_buoys, self.route_params)
+                # Judged with the margins the route was planned with: stricter ones would call out what it allowed
+                clearance, shield, credit, near = self.route_params.levels[self._route_level]
+                self._tracker = tracker or sr.PassTracker(self._route_buoys, replace(
+                    self.route_params, clearance=clearance, shield_margin=shield, credit_margin=credit,
+                    near_range=near))
                 return
         if tracker is None or progress is None:
             return
@@ -924,8 +930,11 @@ class SafePassageNode(Node):
                 child.cancel_goal_async()
                 return False
         except (Canceled, Assistance):
-            if send.done() and send.result().accepted:
-                send.result().cancel_goal_async()
+            def cancel(sent):  # at once when the goal is already accepted, else as soon as it is
+                if sent.result() is not None and sent.result().accepted:
+                    sent.result().cancel_goal_async()
+
+            send.add_done_callback(cancel)
             raise
         outcome = result.result().result
         succeeded = ok(outcome)

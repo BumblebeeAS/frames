@@ -421,6 +421,38 @@ def test_node_and_yaml_agree(node):
     assert set(cfg) <= declared, set(cfg) - declared
 
 
+def test_goal_not_yet_accepted_when_the_interrupt_arrives_is_canceled_once_it_is(ros):
+    """Else it would go on driving the boat beside the goal sent next."""
+    from rclpy.task import Future
+
+    node = spn.SafePassageNode()
+    try:
+        send, canceled = Future(), []
+        client = SimpleNamespace(wait_for_server=lambda timeout_sec: True, send_goal_async=lambda goal: send)
+        gh = Goal([])
+        gh.is_cancel_requested = True                                     # the interrupt: before the goal is accepted
+        with pytest.raises(spn.Canceled):
+            node._run_action(gh, client, "track_path", object(), 5.0, lambda r: True)
+        assert not canceled
+        send.set_result(SimpleNamespace(accepted=True, cancel_goal_async=lambda: canceled.append(True)))
+        for callback in list(send._callbacks):                            # no executor here: run them as it would
+            callback(send)
+        assert canceled == [True]
+    finally:
+        node.destroy_node()
+
+
+def test_pass_tracker_uses_the_margins_of_the_route_in_hand(node):
+    h = Harness(node)
+    seen = []
+    track = node._track
+    node._track = lambda on, progress=None: (track(on, progress), seen.append(node._tracker))[0]
+    assert h.run()[0]
+    tracker = next(t for t in seen if t is not None)
+    level = node.route_params.levels[node._route_level]
+    assert (tracker.p.shield_margin, tracker.p.credit_margin, tracker.p.near_range) == level[1:]
+
+
 # Task 4 Core
 
 def assistance(seq=30, xy=STATION, vehicle_type="usv"):

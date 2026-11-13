@@ -127,7 +127,8 @@ def test_order_directions_and_point_counts(node):
         np.testing.assert_allclose(np.linalg.norm(np.array(run) - centre, axis=1), run and
                                    np.linalg.norm(run[0] - np.array(centre)), atol=1e-6)
         sigma = 1 if n < 2 else -1
-        assert swept(run, centre) == pytest.approx(-sigma * 405.0, abs=1e-6)
+        full = 360.0 * (1 + node.circle_overshoot_points / node.circle_points)   # the circle plus its overshoot
+        assert swept(run, centre) == pytest.approx(-sigma * full, abs=1e-6)
     assert h.phases().count("TRANSIT") == 4
 
 

@@ -145,7 +145,7 @@ class SafePassageNode(Node):
         self.circle_radius_min = param("circle_radius_min", 1.6)
         self.circle_radius_step = param("circle_radius_step", 0.25)
         self.neighbour_clearance = param("neighbour_clearance", 1.25)
-        self.circle_points = param("circle_points", 8)
+        self.circle_points = param("circle_points", 6)
         self.circle_overshoot_points = param("circle_overshoot_points", 1)
         self.cost_threshold = param("cost_threshold", 22)
 

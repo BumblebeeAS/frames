@@ -46,7 +46,7 @@ safe_passage_node:
     circle_radius_min: 1.6         # tracker cost boundary ~1.05 m from a buoy mark, plus margin
     circle_radius_step: 0.25
     neighbour_clearance: 1.25      # R <= nearest other buoy - this (robot radius 0.75 + 0.5)
-    circle_points: 8
+    circle_points: 6               # 60 deg apart: the straight leg between two passes 0.87 x R from the centre
     circle_overshoot_points: 1
     cost_threshold: 22             # = tracker sample_cost_threshold: a circle point at or above is blocked
 

@@ -96,10 +96,3 @@ def test_radius_reports_still_blocked_at_minimum():
     grid = grid_with([(0, 0), (1.6, 0), (2.0, 0), (2.5, 0)])
     r, why = geo.choose_radius(grid, [0, 0], [], 2.5, 1.6, 0.25, 1.25, 22)
     assert r == pytest.approx(1.6) and "still blocked" in why
-
-
-def test_lethal_centroid():
-    grid = grid_with([(3.0, 4.0)])
-    np.testing.assert_allclose(geo.lethal_centroid(grid, [3.5, 4.0], 1.0), [3.0, 4.0], atol=0.06)
-    assert geo.lethal_centroid(grid, [10, 10], 1.0) is None
-    assert geo.lethal_centroid(EMPTY, [0, 0], 1.0) is None

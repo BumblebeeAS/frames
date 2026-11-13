@@ -1,11 +1,9 @@
 # RobotX 2026 Task 1 (Safe Passage) on asv5: scripts/safe_passage_node.py, action /asv5/safe_passage.
 # Goal: the drone's buoys (lat/lon + state). Planning in asv5/map (ENU); circles are stop-and-go TrackPath goals.
+# Buoys are located on the costmap below: no lidar topic of its own.
 safe_passage_node:
   ros__parameters:
     action_name: "/asv5/safe_passage"
-    # Gravity-aligned, base_link, 0.1 m voxel, 0.10..1.00 m above base_link (software-asv-3 asv5 cloud_filter).
-    # The voxel only thins points close in; at range the beam spacing decides how many land on a buoy.
-    cloud_topic: "/asv5/os0/filtered"
     costmap_topic: "/asv5/global_costmap/costmap"
     incident_topic: "/asv5/task4/incident_active"  # latched Bool from the Task 4 handler
     marker_topic: "/asv5/safe_passage/markers"
@@ -14,34 +12,32 @@ safe_passage_node:
     track_path_action: "/asv5/track_path"
     from_ll_service: "/asv5/fromLL"
     service_timeout: 2.0
-    tf_timeout: 0.1
 
-    # Lidar -> landmarks, only inside the field: discs of max_shift_eff + field_crop_margin around every drone buoy
-    cloud_rate: 5.0                # clouds processed per second at most
-    footprint_mask_x: 0.9          # half-length of the own-boat box dropped in base_link (hull 1.16 x 0.90 m)
-    footprint_mask_y: 0.75         # half-width
-    field_crop_margin: 1.5
-    cluster_eps: 0.3               # points closer than this join one cluster
-    cluster_min_points: 3
-    buoy_min_extent: 0.15          # buoy-sized: longest side of the cluster footprint (RoboBuoy ~0.43 m square)
-    buoy_max_extent: 0.9
-    edge_margin: 0.3               # clusters this close to the field edge were cut by it: dropped
-    landmark_assoc_radius: 0.5     # a detection this close updates a landmark instead of starting one
-    landmark_smoothing: 0.3        # fraction of the gap each detection moves its landmark
-    landmark_min_hits: 3           # hits before a landmark is usable
-    landmark_expiry: 60.0          # s unseen before a landmark is dropped
+    # Layout alignment (frames/utils/buoy_align.py): the drone's buoys are shifted as one layout onto the costmap.
+    # Blobs: lethal cells of the costmap, joined across small gaps; only buoy-sized ones are matched.
+    join_gap: 0.6                  # lethal cells closer than this are one blob (buoys are >= 1.7 m apart)
+    blob_min_extent: 0.1           # buoy-sized: longer side of the blob's bounding box (RoboBuoy 0.43 m, smeared)
+    blob_max_extent: 1.2
+    field_margin: 12.0             # costmap read this far beyond every position a buoy can shift to
+    # Shift t: every shift on a grid is scored by how close the shifted drone buoys land to a buoy-sized blob
+    max_shift: 10.0                # shifts searched: +-this in x and y
+    shift_step: 0.1
+    score_sigma: 0.4               # a buoy this far from a blob scores exp(-1/2); the score is the sum over buoys
+    min_score: 3.5                 # a solve is accepted from this score (about the buoys landing on blobs) ...
+    min_ratio: 1.5                 # ... if it is also this many times the runner-up's
+    runner_up_separation: 1.0      # the runner-up is the best shift at least this far from the winner
+    match_radius: 0.75             # pairs this close refine the winner (least squares) and count as matched
+    # Lock: the shift is used once consecutive accepted solves agree; then it is the median of recent nearby solves
+    lock_solves: 3
+    lock_tolerance: 1.0
+    basin: 2.0                     # once locked, only shifts this close to the locked one are searched
+    median_window: 10
+    align_timeout: 30.0            # ALIGN holds this long for a lock, then goes on with the drone's positions as is
 
-    # Drone-to-lidar shift t: used once shift_min_inliers buoys agree on it
-    max_shift: 4.0
-    shift_spacing_factor: 0.8      # max shift also <= this x the tightest drone buoy spacing (no shift by a whole buoy)
-    shift_inlier_radius: 0.75
-    shift_min_inliers: 3
-
-    # Buoy estimate E_i: nearest unclaimed landmark within r_i of P_i = C_i + t, else costmap lethal cells, else P_i
-    snap_radius: 2.0               # r_i without an accepted shift
-    snap_radius_matched: 1.0       # r_i with one
+    # Buoy estimate E_i: nearest unclaimed buoy-sized blob within r_i of P_i = C_i + t, else P_i
+    snap_radius: 1.0               # r_i
     snap_spacing_factor: 0.5       # r_i also <= this x the distance to the nearest other drone buoy
-    claim_radius: 1.0              # landmarks this close to a circled buoy are off limits
+    claim_radius: 1.0              # blobs this close to a circled buoy are off limits
     estimate_move_threshold: 0.3   # remaining circle points move only when E_i moves more than this
 
     # Circle: start point + circle_points per 360 deg + overshoot

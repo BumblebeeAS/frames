@@ -8,10 +8,12 @@ circled one at a time with stop-and-go TrackPath goals:
   TRANSIT  TrackPath to p0, where the boat joins the circle tangentially in the buoy's direction
   CIRCLE   TrackPath to p1 .. pN+overshoot, N points per 360 deg; each goal waits for the previous one's result
 
-Entry and red are circled clockwise (red stays on starboard), green and exit counterclockwise. Each circle is centred
-on the buoy estimate E_i (frames.utils.buoy_field), read again before every goal: a lidar landmark near the drone's
-position plus the drone-to-lidar shift, else the costmap's lethal cells there, else that predicted position. The
-landmarks come from lidar clouds processed in the background for the whole goal.
+Entry and red are circled clockwise (red stays on starboard), green and exit counterclockwise.
+
+The drone's positions can be metres off as one layout, so before driving the node lines the layout up with the
+costmap (frames.utils.buoy_align): ALIGN holds until the shift locks or align_timeout passes, and the buoys are
+ordered only then. Each circle is centred on the buoy estimate E_i, read again before every goal: the small
+costmap blob nearest the shifted drone position, else that position. Without a lock the shift is zero.
 
 Retries: a failed point is re-placed and tried again point_retries times, then skipped; max_consecutive_skips in a
 row, or a start point that cannot be reached, fails the attempt. A buoy gets buoy_attempts attempts. Failed reds and
@@ -44,15 +46,13 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallb
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time as RosTime
 from robot_localization.srv import FromLL
-from sensor_msgs.msg import PointCloud2
-from sensor_msgs_py.point_cloud2 import read_points_numpy
 from std_msgs.msg import Bool, ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
-from frames.utils import buoy_field as bf
+from frames.utils import buoy_align as ba
 from frames.utils import safe_passage_geometry as geo
 
 # nav2 costmaps publish reliable transient local; the incident flag is latched the same way
@@ -85,17 +85,8 @@ class Buoy:
     sigma: int = 0                      # +1 clockwise, -1 counterclockwise, 0 never circled
     status: str = "pending"             # pending | circled | failed
     attempts: int = 0
-    estimate: Optional[bf.Estimate] = None  # the one the last circle used
+    estimate: Optional[ba.Estimate] = None  # the one the last circle used
     radius: float = 0.0
-
-
-def quaternion_matrix(q) -> np.ndarray:
-    x, y, z, w = q.x, q.y, q.z, q.w
-    return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ])
 
 
 class SafePassageNode(Node):
@@ -104,22 +95,18 @@ class SafePassageNode(Node):
         param = lambda name, default: self.declare_parameter(name, default).value  # noqa: E731
 
         # Wiring
-        self.cloud_topic = param("cloud_topic", "/asv5/os0/filtered")
         self.costmap_topic = param("costmap_topic", "/asv5/global_costmap/costmap")
         self.incident_topic = param("incident_topic", "/asv5/task4/incident_active")
         self.global_frame_id = param("global_frame_id", "asv5/map")
         self.base_link_frame_id = param("base_link_frame_id", "asv5/base_link")
         self.service_timeout = param("service_timeout", 2.0)
-        self.tf_timeout = param("tf_timeout", 0.1)
 
-        # Cloud
-        self.cloud_rate = param("cloud_rate", 5.0)
-        self.footprint_mask_x = param("footprint_mask_x", 0.9)
-        self.footprint_mask_y = param("footprint_mask_y", 0.75)
-        defaults = bf.FieldParams()
-        self.field_params = bf.FieldParams(**{
+        # Alignment of the drone's layout with the costmap
+        defaults = ba.AlignParams()
+        self.align_params = ba.AlignParams(**{
             name: type(getattr(defaults, name))(param(name, getattr(defaults, name)))
-            for name in bf.FieldParams.__dataclass_fields__})
+            for name in ba.AlignParams.__dataclass_fields__})
+        self.align_timeout = param("align_timeout", 30.0)
 
         # Estimate and circle
         self.estimate_move_threshold = param("estimate_move_threshold", 0.3)
@@ -152,28 +139,26 @@ class SafePassageNode(Node):
             self.get_logger().warning("goal_sample_radius under the tracker's sample_spacing (0.25 m) samples nothing")
 
         self.cb_group = ReentrantCallbackGroup()
-        self.cloud_group = MutuallyExclusiveCallbackGroup()
+        self.costmap_group = MutuallyExclusiveCallbackGroup()  # a solve takes a while: never two at once
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
-        self._costmap: Optional[OccupancyGrid] = None
+        self._grid: Optional[geo.CostGrid] = None
         self.create_subscription(OccupancyGrid, self.costmap_topic, self._on_costmap, LATCHED_QOS,
-                                 callback_group=self.cb_group)
+                                 callback_group=self.costmap_group)
         self._incident = False
         self.create_subscription(Bool, self.incident_topic, self._on_incident, LATCHED_QOS,
                                  callback_group=self.cb_group)
-        self.create_subscription(PointCloud2, self.cloud_topic, self._on_cloud, qos_profile_sensor_data,
-                                 callback_group=self.cloud_group)
         self.marker_pub = self.create_publisher(MarkerArray, param("marker_topic", "/asv5/safe_passage/markers"), 1)
+        self.create_timer(MARKER_PERIOD_S, self._publish_markers, callback_group=self.cb_group)
 
-        # Goal state shared with the cloud thread: the field, the buoys, the circle being driven
+        # Goal state shared with the costmap thread: the aligner, the buoys, the circle being driven
         self._lock = threading.Lock()
-        self._field: Optional[bf.BuoyField] = None
+        self._aligner: Optional[ba.Aligner] = None
         self._buoys: list[Buoy] = []
         self._circle: list = []      # [(xy, yaw)] being driven, for markers
         self._target: Optional[np.ndarray] = None
-        self._last_cloud = 0.0
-        self._last_markers = 0.0
+        self._logged_t = np.zeros(2)
         self._pause_enabled = False
 
         self.track_path_name = param("track_path_action", "/asv5/track_path")
@@ -187,7 +172,7 @@ class SafePassageNode(Node):
             execute_callback=self._execute, goal_callback=self._on_goal,
             cancel_callback=lambda _: CancelResponse.ACCEPT, callback_group=self.cb_group,
         )
-        self.get_logger().info(f"Safe Passage ready: clouds on {self.cloud_topic}, incidents on {self.incident_topic}")
+        self.get_logger().info(f"Safe Passage ready: costmap {self.costmap_topic}, incidents on {self.incident_topic}")
 
     # Goal handling
 
@@ -211,7 +196,7 @@ class SafePassageNode(Node):
                 return result
             finally:
                 with self._lock:
-                    self._field, self._buoys, self._circle, self._target = None, [], [], None
+                    self._aligner, self._buoys, self._circle, self._target = None, [], [], None
             if summary is None:
                 result.success, result.message = False, "no buoy could be converted to the map frame"
                 goal_handle.abort()
@@ -233,16 +218,21 @@ class SafePassageNode(Node):
             buoys.append(Buoy(len(buoys), b.state, xy, geo.SIGMA.get(b.state, 0)))
         if not any(b.sigma for b in buoys):
             return None
-        boat = self._boat_xy()
-        order = geo.order_buoys([b.xy for b in buoys], [b.state for b in buoys],
-                                boat if boat is not None else np.mean([b.xy for b in buoys], axis=0))
-        field = bf.BuoyField([b.xy for b in buoys], self.field_params)
+        aligner = ba.Aligner([b.xy for b in buoys], self.align_params)
         with self._lock:
-            self._field, self._buoys = field, buoys
+            self._aligner, self._buoys, self._logged_t = aligner, buoys, np.zeros(2)
         self.get_logger().info(
             "Safe Passage buoys: " + ", ".join(f"{b.index}:{b.state}({b.xy[0]:.1f},{b.xy[1]:.1f})" for b in buoys)
-            + f"; order {order}; tightest spacing {float(field.nn.min()):.2f} m, max shift {field.max_shift:.2f} m, "
-            f"field radius {field.crop_r:.2f} m; pause_on_incident {self._pause_enabled}")
+            + f"; tightest spacing {float(aligner.nn.min()):.2f} m; pause_on_incident {self._pause_enabled}")
+        self._align(goal_handle, len(buoys))
+
+        # Ordered where the buoys are now believed to be: a shift of metres changes which is nearest
+        boat = self._boat_xy()
+        with self._lock:
+            placed = aligner.predicted()
+        order = geo.order_buoys(list(placed), [b.state for b in buoys],
+                                boat if boat is not None else placed.mean(axis=0))
+        self.get_logger().info(f"Order {order}")
 
         total = len(order)
         exit_ = [i for i in order if buoys[i].state == geo.EXIT]
@@ -268,6 +258,64 @@ class SafePassageNode(Node):
                       if e is not None else "")
             lines.append(f"{i}:{b.state} {b.status} ({b.attempts} attempt(s){detail})")
         return not failed, len(circled), len(failed), "; ".join(lines)
+
+    # Alignment
+
+    def _align(self, goal_handle, total: int):
+        """Hold until the drone layout locks onto the costmap or align_timeout passes. Raises Canceled."""
+        self._align_step(self._snapshot())  # the costmap already here; later ones arrive through _on_costmap
+        start = time.monotonic()
+
+        def locked():
+            with self._lock:
+                matched, done = self._aligner.matched, self._aligner.locked
+            goal_handle.publish_feedback(SafePassage.Feedback(phase="ALIGN", buoy_total=total, shift_inliers=matched))
+            return done
+
+        if self.align_timeout > 0.0 and self._wait(goal_handle, locked, self.align_timeout):
+            return
+        with self._lock:
+            aligner = self._aligner
+            if aligner.locked:
+                return
+            last = aligner.last
+        self.get_logger().warning(
+            f"Layout not aligned after {time.monotonic() - start:.0f} s: continuing with the drone's positions as "
+            f"they are (last solve t ({last.t[0]:.2f}, {last.t[1]:.2f}) score {last.score:.1f}, runner-up "
+            f"{last.second:.1f}, {len(aligner.buoy_blobs)} buoy-sized blobs). It keeps solving and may still lock")
+
+    def _align_step(self, grid: geo.CostGrid):
+        """One costmap through the aligner of the running goal, logged."""
+        with self._lock:
+            aligner = self._aligner
+        if aligner is None:
+            return
+        started = time.monotonic()
+        all_blobs = ba.blobs(grid, aligner.candidates, aligner.reach(), aligner.p.join_gap)
+        with self._lock:
+            if self._aligner is not aligner:
+                return
+            was_locked = aligner.locked
+            fresh = aligner.update(all_blobs)
+            t, locked, matched = aligner.t.copy(), aligner.locked, aligner.matched
+            small, large = len(aligner.buoy_blobs), len(aligner.structures)
+        took = (time.monotonic() - started) * 1e3
+        verdict = "accepted" if fresh.accepted else "rejected"
+        detail = (f"solve t ({fresh.t[0]:.2f}, {fresh.t[1]:.2f}) score {fresh.score:.1f} runner-up {fresh.second:.1f} "
+                  f"at ({fresh.second_t[0]:.1f}, {fresh.second_t[1]:.1f}) {verdict}; {small} buoy-sized blobs, "
+                  f"{large} larger; {took:.0f} ms")
+        if locked and not was_locked:
+            self._logged_t = t
+            self.get_logger().info(f"Layout LOCKED: shift t ({t[0]:.2f}, {t[1]:.2f}), {matched} of "
+                                   f"{len(aligner.candidates)} drone buoys on a blob. {detail}")
+        elif not locked:
+            self.get_logger().info(f"Aligning: {detail}")
+        elif np.linalg.norm(t - self._logged_t) > 0.2:
+            self.get_logger().info(f"Shift now t ({t[0]:.2f}, {t[1]:.2f}), was ({self._logged_t[0]:.2f}, "
+                                   f"{self._logged_t[1]:.2f}); {matched} drone buoys on a blob. {detail}")
+            self._logged_t = t
+        else:
+            self.get_logger().debug(f"Locked t ({t[0]:.2f}, {t[1]:.2f}), {matched} matched. {detail}")
 
     # One buoy
 
@@ -306,8 +354,9 @@ class SafePassageNode(Node):
         buoy.estimate, buoy.radius = estimate, radius
         self.get_logger().info(
             f"{label}: centre ({centre[0]:.2f}, {centre[1]:.2f}) from {estimate.source}, "
-            f"{np.linalg.norm(centre - buoy.xy):.2f} m from the drone, {np.linalg.norm(centre - estimate.predicted):.2f}"
-            f" m from predicted, search radius {estimate.radius:.2f}; R {radius:.2f} ({why}); "
+            f"{np.linalg.norm(centre - buoy.xy):.2f} m from the drone, "
+            f"{np.linalg.norm(centre - estimate.predicted):.2f} m from predicted, search radius "
+            f"{estimate.radius:.2f}; R {radius:.2f} ({why}); "
             f"{'clockwise' if buoy.sigma > 0 else 'counterclockwise'} from {math.degrees(phi0):.0f} deg")
         with self._lock:
             self._circle = points
@@ -342,25 +391,24 @@ class SafePassageNode(Node):
                     return False
         return True
 
-    def _estimate(self, buoy: Buoy) -> bf.Estimate:
-        grid = self._snapshot()
+    def _estimate(self, buoy: Buoy) -> ba.Estimate:
         with self._lock:
             claimed = [b.estimate.xy for b in self._buoys if b.status == "circled" and b.estimate is not None]
-            return self._field.estimate(buoy.index, grid, claimed)
+            return self._aligner.estimate(buoy.index, claimed)
 
     def _neighbours(self, buoy: Buoy) -> list:
         """Every other buoy where we best know it: the centre it was circled around, else its predicted position."""
         with self._lock:
-            t = self._field.shift.t
+            t = self._aligner.t
             return [b.estimate.xy if b.status == "circled" and b.estimate is not None else b.xy + t
                     for b in self._buoys if b.index != buoy.index]
 
     def _feedback(self, goal_handle, phase, buoy: Buoy, position, total, point=0, point_total=0, source=""):
         with self._lock:
-            inliers = self._field.shift.inliers if self._field is not None else 0
+            matched = self._aligner.matched if self._aligner is not None else 0
         goal_handle.publish_feedback(SafePassage.Feedback(
             phase=phase, buoy_index=position, buoy_total=total, buoy_state=buoy.state, point=point,
-            point_total=point_total, estimate_source=source, shift_inliers=inliers))
+            point_total=point_total, estimate_source=source, shift_inliers=matched))
 
     # Driving
 
@@ -500,7 +548,12 @@ class SafePassageNode(Node):
         return np.array([t.x, t.y])
 
     def _on_costmap(self, msg: OccupancyGrid):
-        self._costmap = msg
+        if msg.header.frame_id != self.global_frame_id:
+            self.get_logger().warning(f"Costmap in '{msg.header.frame_id}', not '{self.global_frame_id}': ignored",
+                                      throttle_duration_sec=5.0)
+            return
+        self._grid = geo.CostGrid.from_msg(msg)
+        self._align_step(self._grid)
 
     def _on_incident(self, msg: Bool):
         if msg.data != self._incident:
@@ -508,78 +561,20 @@ class SafePassageNode(Node):
         self._incident = bool(msg.data)
 
     def _snapshot(self) -> geo.CostGrid:
-        msg = self._costmap
-        if msg is None:
+        grid = self._grid
+        if grid is None:
             self.get_logger().warning(f"No costmap on {self.costmap_topic}, using an empty one",
                                       throttle_duration_sec=5.0)
             return geo.CostGrid.empty()
-        if msg.header.frame_id != self.global_frame_id:
-            self.get_logger().warning(f"Costmap in '{msg.header.frame_id}', not '{self.global_frame_id}': ignored",
-                                      throttle_duration_sec=5.0)
-            return geo.CostGrid.empty()
-        return geo.CostGrid.from_msg(msg)
-
-    # Lidar
-
-    def _on_cloud(self, msg: PointCloud2):
-        """Feeds the buoy field while a goal runs: own-boat mask, map frame, field crop, clusters, landmarks."""
-        if self._field is None:
-            return
-        now = time.monotonic()
-        if now - self._last_cloud < 1.0 / max(self.cloud_rate, 1e-3):
-            return
-        self._last_cloud = now
-        points = read_points_numpy(msg, field_names=["x", "y", "z"], skip_nans=True).astype(float)
-        if msg.header.frame_id == self.base_link_frame_id:
-            points = bf.remove_box(points, self.footprint_mask_x, self.footprint_mask_y)
-        else:
-            self.get_logger().warning(f"Cloud in '{msg.header.frame_id}', not '{self.base_link_frame_id}': own boat "
-                                      "not masked", throttle_duration_sec=30.0)
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                self.global_frame_id, msg.header.frame_id, RosTime.from_msg(msg.header.stamp),
-                Duration(seconds=self.tf_timeout)).transform
-        except tf2_ros.TransformException as e:
-            # TF behind the cloud (seen on asv5): the latest transform is off by the lag, still worth a cloud
-            try:
-                transform = self.tf_buffer.lookup_transform(
-                    self.global_frame_id, msg.header.frame_id, RosTime()).transform
-            except tf2_ros.TransformException:
-                self.get_logger().warning(f"Cloud skipped, no transform: {e}", throttle_duration_sec=5.0)
-                return
-            self.get_logger().warning(f"Cloud transformed with the latest TF, none at its stamp: {e}",
-                                      throttle_duration_sec=5.0)
-        t = transform.translation
-        xy = (points @ quaternion_matrix(transform.rotation).T + [t.x, t.y, t.z])[:, :2]
-        stamp = self.get_clock().now().nanoseconds * 1e-9
-        with self._lock:
-            field = self._field
-            if field is None:
-                return
-            detections, stats = field.detect(xy)
-            changes = field.update(detections, stamp)
-            shift = field.shift
-        self.get_logger().debug(f"Cloud: {stats}, {changes}")
-        if changes["born"] or changes["expired"]:
-            self.get_logger().info(f"Landmarks: {changes['born']} new, {changes['expired']} expired, "
-                                   f"{changes['usable']}/{changes['landmarks']} usable "
-                                   f"({stats['detections']} detections in {stats['field']} field points)")
-        if changes["shift_changed"]:
-            self.get_logger().info(
-                f"Shift {'accepted' if shift.accepted else 'not accepted'}: t ({shift.t[0]:.2f}, {shift.t[1]:.2f}), "
-                f"{shift.best_inliers} agree (next best {shift.second_inliers})")
-        if now - self._last_markers >= MARKER_PERIOD_S:
-            self._last_markers = now
-            self._publish_markers()
+        return grid
 
     def _publish_markers(self):
         with self._lock:
-            field, buoys, circle, target = self._field, list(self._buoys), list(self._circle), self._target
-            if field is None:
+            aligner, buoys, circle, target = self._aligner, list(self._buoys), list(self._circle), self._target
+            if aligner is None:
                 return
-            landmarks = [(lm.xy.copy(), lm.hits) for lm in field.landmarks]
-            t = field.shift.t.copy()
-            min_hits = field.p.landmark_min_hits
+            t, locked = aligner.t.copy(), aligner.locked
+            small, large = aligner.buoy_blobs.copy(), aligner.structures.copy()
         stamp = self.get_clock().now().to_msg()
         markers = MarkerArray()
         markers.markers.append(Marker(action=Marker.DELETEALL))
@@ -590,19 +585,22 @@ class SafePassageNode(Node):
             m.ns, m.id, m.type, m.action = ns, mid, kind, Marker.ADD
             m.pose.position.x, m.pose.position.y, m.pose.position.z = float(xy[0]), float(xy[1]), z
             m.pose.orientation.w = 1.0
-            m.scale.x = m.scale.y = m.scale.z = scale
+            m.scale.x = m.scale.y = m.scale.z = float(scale)
             m.color = ColorRGBA(r=rgb[0], g=rgb[1], b=rgb[2], a=alpha)
             return m
 
         for b in buoys:
             rgb = STATE_COLOURS.get(b.state, (1.0, 1.0, 1.0))
-            markers.markers.append(marker("candidates", b.index, Marker.SPHERE, b.xy, 0.4, rgb, 0.5))
-            markers.markers.append(marker("predicted", b.index, Marker.SPHERE, b.xy + t, 0.25, rgb))
+            markers.markers.append(marker("drone", b.index, Marker.SPHERE, b.xy, 0.4, rgb, 0.4))
+            markers.markers.append(marker("predicted", b.index, Marker.SPHERE, b.xy + t, 0.25, rgb,
+                                          1.0 if locked else 0.4))
             if b.estimate is not None:
                 markers.markers.append(marker("estimates", b.index, Marker.CYLINDER, b.estimate.xy, 0.5, rgb, 0.9))
-        for k, (xy, hits) in enumerate(landmarks):
-            rgb = (1.0, 0.6, 0.0) if hits >= min_hits else (0.6, 0.6, 0.6)
-            markers.markers.append(marker("landmarks", k, Marker.CUBE, xy, 0.3, rgb, 0.8, z=0.3))
+        for k, xy in enumerate(small):
+            markers.markers.append(marker("buoy blobs", k, Marker.CUBE, xy, 0.3, (0.6, 1.0, 0.2), 0.8, z=0.3))
+        for k, blob in enumerate(large):
+            markers.markers.append(marker("structures", k, Marker.CYLINDER, blob[:2], max(blob[3], 0.3),
+                                          (1.0, 0.0, 0.0), 0.3))
         if circle:
             strip = marker("circle", 0, Marker.LINE_STRIP, (0.0, 0.0), 0.05, (1.0, 1.0, 1.0))
             strip.points = [Point(x=float(p[0]), y=float(p[1])) for p, _ in circle]

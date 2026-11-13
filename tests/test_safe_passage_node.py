@@ -1,4 +1,4 @@
-"""safe_passage_node with stubbed TrackPath, TF, fromLL and costmap: order, directions, retries, pause, lidar."""
+"""safe_passage_node with stubbed TrackPath, TF, fromLL and costmap: alignment, order, directions, retries, pause."""
 import math
 import sys
 import threading
@@ -28,6 +28,7 @@ ROOT = Path(__file__).parents[1]
 sys.path.insert(0, str(ROOT))
 import importlib.util  # noqa: E402
 
+from frames.utils import buoy_align as ba  # noqa: E402
 from frames.utils import safe_passage_geometry as geo  # noqa: E402
 
 spec = importlib.util.spec_from_file_location("safe_passage_node", ROOT / "scripts/safe_passage_node.py")
@@ -63,6 +64,7 @@ class Harness:
         node._snapshot = geo.CostGrid.empty
         node._from_ll = lambda lat, lon: np.array([lat, lon])
         node._run_action = self._run_action
+        node.align_timeout = 0.0  # no costmap in most tests: go straight on with the drone's positions
         node.preempt_grace = 0.2
         node.resume_settle = 0.05
 
@@ -226,63 +228,79 @@ def test_cancel_while_paused(node):
     node._incident = False
 
 
-def test_cloud_feeds_landmarks_and_moves_the_circle_onto_them(node):
-    """A buoy 1.2 m off the drone's position, seen by the lidar: the circle is centred on what the lidar sees."""
-    from sensor_msgs.msg import PointCloud2, PointField
-    from sensor_msgs_py.point_cloud2 import create_cloud
-    from frames.utils import buoy_field as bf
+LAYOUT = np.array([[0.0, 0.0], [9.0, 3.0], [10.0, -3.0], [20.0, 0.0], [15.0, 8.0], [5.0, -8.0]])
+STATES = ["flashing_blue", "flashing_red", "flashing_green", "steady_blue", "off", "off"]
+SHIFT = np.array([2.0, 6.0])
 
-    truth = np.array([11.2, 0.0])
-    h = Harness(node, [buoy("flashing_red", [10.0, 0.0])], boat=(0.0, 0.0))
-    node._field = bf.BuoyField([[10.0, 0.0]], node.field_params)
-    node._buoys = [spn.Buoy(0, "flashing_red", np.array([10.0, 0.0]), 1)]
-    node.base_link_frame_id = "asv5/base_link"
-    # Boat at the origin, base_link = map: the transform is identity
-    identity = SimpleNamespace(transform=SimpleNamespace(
-        translation=SimpleNamespace(x=0.0, y=0.0, z=0.0), rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)))
-    node.tf_buffer.lookup_transform = lambda *a, **k: identity
-    face = np.stack([np.full(8, truth[0] - 0.2), np.linspace(-0.2, 0.2, 8), np.full(8, 0.2)], 1)
-    hull = np.array([[0.3, 0.1, 0.2], [-0.4, 0.3, 0.2], [0.5, -0.2, 0.3]])  # own boat: masked
-    fields = [PointField(name=n, offset=4 * i, datatype=PointField.FLOAT32, count=1) for i, n in enumerate("xyz")]
-    for _ in range(4):
-        from std_msgs.msg import Header
-        cloud = create_cloud(Header(frame_id="asv5/base_link"), fields, np.vstack([face, hull]).tolist())
-        node._last_cloud = 0.0
-        node._on_cloud(cloud)
-    assert len(node._field.usable()) == 1
-    estimate = node._estimate(node._buoys[0])
-    assert estimate.source == bf.LANDMARK
-    assert np.linalg.norm(estimate.xy - [truth[0] - 0.2, 0.0]) < 0.05  # the visible face
+
+def costmap(points, size=80.0, origin=(-30.0, -40.0), res=0.1):
+    n = int(size / res)
+    data = np.zeros((n, n), dtype=np.int16)
+    for x, y in points:
+        c, r = int((x - origin[0]) / res), int((y - origin[1]) / res)
+        data[r - 2:r + 2, c - 2:c + 2] = 100
+    return geo.CostGrid(data, res, origin[0], origin[1])
+
+
+def feed(node, grid, times=6, period=0.05):
+    """Costmaps arriving while the goal runs."""
+    def loop():
+        for _ in range(times):
+            time.sleep(period)
+            node._align_step(grid)
+    threading.Thread(target=loop, daemon=True).start()
+
+
+def test_layout_is_aligned_to_the_costmap_before_any_driving(node):
+    """Drone layout 6 m off: the node holds in ALIGN, locks the shift, then circles the real buoys."""
+    grid = costmap(LAYOUT + SHIFT)
+    h = Harness(node, [buoy(s, xy) for s, xy in zip(STATES, LAYOUT)], boat=(-10.0, 5.0))
+    node._snapshot = lambda: grid
+    node.align_timeout = 5.0
+    feed(node, grid)
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 4, message
+    assert h.phases()[0] == "ALIGN" and "ALIGN" not in h.phases()[h.phases().index("TRANSIT"):]
+    per = node.circle_points + node.circle_overshoot_points + 1
+    for n, i in enumerate([0, 1, 2, 3]):  # entry, red, green, exit
+        run = np.array(h.targets[n * per:(n + 1) * per])
+        radii = np.linalg.norm(run - (LAYOUT[i] + SHIFT), axis=1)
+        assert radii.max() - radii.min() < 0.15, (i, radii)  # circled around the real buoy, not the drone's
+    assert "BLOB" in message
+    assert h.goal.feedback[-1].shift_inliers == len(LAYOUT)
+    node._aligner, node._buoys = ba.Aligner(LAYOUT, node.align_params), []
     node._publish_markers()  # must not raise
-    node._field, node._buoys = None, []
+    node._aligner = None
 
 
-def test_cloud_falls_back_to_the_latest_transform_when_tf_lags(node):
-    import tf2_ros
-    from sensor_msgs.msg import PointField
-    from sensor_msgs_py.point_cloud2 import create_cloud
-    from std_msgs.msg import Header
-    from frames.utils import buoy_field as bf
+def test_no_lock_goes_on_with_the_drone_positions_after_the_timeout(node):
+    h = Harness(node, [buoy("flashing_red", [0.0, 0.0])])
+    node.align_timeout = 0.3
+    started = time.monotonic()
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 1 and "PREDICTED" in message
+    assert 0.3 <= time.monotonic() - started < 2.0
+    radii = np.linalg.norm(np.array(h.targets), axis=1)
+    assert radii.max() - radii.min() < 1e-6
 
-    node._field = bf.BuoyField([[10.0, 0.0]], node.field_params)
-    node.base_link_frame_id = "asv5/base_link"
-    identity = SimpleNamespace(transform=SimpleNamespace(
-        translation=SimpleNamespace(x=0.0, y=0.0, z=0.0), rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)))
-    asked = []
 
-    def lookup(target, source, when, timeout=None):
-        asked.append(when.nanoseconds)
-        if when.nanoseconds:  # at the cloud stamp: TF has not caught up
-            raise tf2_ros.ExtrapolationException("would require extrapolation into the future")
-        return identity
-    node.tf_buffer.lookup_transform = lookup
-    face = np.stack([np.full(8, 9.8), np.linspace(-0.2, 0.2, 8), np.full(8, 0.2)], 1)
-    fields = [PointField(name=n, offset=4 * i, datatype=PointField.FLOAT32, count=1) for i, n in enumerate("xyz")]
-    header = Header(frame_id="asv5/base_link")
-    header.stamp.sec = 100
-    for _ in range(3):
-        node._last_cloud = 0.0
-        node._on_cloud(create_cloud(header, fields, face.tolist()))
-    assert asked[:2] == [100 * 10**9, 0]  # stamp first, then latest
-    assert len(node._field.usable()) == 1
-    node._field = None
+def test_cancel_while_aligning(node):
+    h = Harness(node, [buoy("flashing_red", [0.0, 0.0])])
+    node.align_timeout = 5.0
+    threading.Timer(0.2, lambda: setattr(h.goal, "is_cancel_requested", True)).start()
+    with pytest.raises(spn.Canceled):
+        h.run()
+    assert h.targets == []
+
+
+def test_circle_follows_a_blob_near_the_drone_position_without_a_lock(node):
+    """One buoy cannot lock a shift, but a blob within the snap radius still centres the circle."""
+    grid = costmap([[10.7, 0.0]])
+    h = Harness(node, [buoy("flashing_red", [10.0, 0.0])], boat=(0.0, 0.0))
+    node._snapshot = lambda: grid
+    feed(node, grid, times=2, period=0.0)
+    time.sleep(0.05)
+    ok, circled, failed, message = h.run()
+    assert ok and "BLOB" in message, message
+    radii = np.linalg.norm(np.array(h.targets) - [10.7, 0.0], axis=1)
+    assert radii.max() - radii.min() < 0.15

@@ -6,7 +6,7 @@ east. sigma is the circling direction: +1 clockwise seen from above, -1 counterc
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Sequence
 
 import numpy as np
 
@@ -54,23 +54,6 @@ class CostGrid:
         out = np.zeros(len(col), dtype=np.int16)
         out[inside] = self.data[row[inside], col[inside]]
         return np.maximum(out, 0)
-
-    def lethal_within(self, centre, radius: float) -> np.ndarray:
-        """Centres of lethal cells within radius of centre, (n, 2)."""
-        rows, cols = np.nonzero(self.data >= LETHAL)
-        if not len(rows):
-            return np.zeros((0, 2))
-        gx = (cols + 0.5) * self.resolution
-        gy = (rows + 0.5) * self.resolution
-        c, s = math.cos(self.origin_yaw), math.sin(self.origin_yaw)
-        xy = np.stack([self.origin_x + c * gx - s * gy, self.origin_y + s * gx + c * gy], axis=1)
-        return xy[np.linalg.norm(xy - np.asarray(centre)[:2], axis=1) <= radius]
-
-
-def lethal_centroid(grid: CostGrid, around, radius: float) -> Optional[np.ndarray]:
-    """Mean of the lethal cells within radius of around (a buoy as the costmap sees it), or None."""
-    cells = grid.lethal_within(around, radius)
-    return cells.mean(axis=0) if len(cells) else None
 
 
 def order_buoys(positions: Sequence, states: Sequence[str], boat) -> list[int]:

@@ -62,7 +62,8 @@ class Harness:
         self.acks, self.tasks, self.reports, self.report_seq = [], [], [], 412
         node._send_incident_ack = self.acks.append
         node._send_task = lambda task, goal_handle=None: self.tasks.append(task)
-        node._send_readiness = lambda gh, seq: (self.reports.append(seq), self.report_seq)[1]
+        self.report_unsure = False
+        node._send_readiness = lambda gh, seq: (self.reports.append(seq), (self.report_seq, self.report_unsure))[1]
         self.results, self.boat, self.targets = list(results), np.array(boat), []
         node._boat_xy = lambda: self.boat
         node._snapshot = geo.CostGrid.empty
@@ -409,11 +410,11 @@ def costmap(points, size=80.0, origin=(-30.0, -40.0), res=0.1):
 
 
 def feed(node, grid, times=6, period=0.05):
-    """Costmaps arriving while the goal runs."""
+    """Costmaps arriving while the goal runs: a new message, so a new grid, each time."""
     def loop():
         for _ in range(times):
             time.sleep(period)
-            node._align_step(grid)
+            node._align_step(geo.CostGrid(grid.data, grid.resolution, grid.origin_x, grid.origin_y))
     threading.Thread(target=loop, daemon=True).start()
 
 
@@ -509,7 +510,7 @@ def test_reports_go_out_through_real_actions(ros):
         ack.report.command_seq = 30
         assert node._send_blocking(node.incident_ack, ack) is None
         assert node._send_blocking(node.set_task, SetTask.Goal(task="dynamic_incident")) == "no heartbeat"
-        assert node._send_readiness(Goal([]), 30) == 412
+        assert node._send_readiness(Goal([]), 30) == (412, False)
         assert got == [("ack", 30), ("task", "dynamic_incident"), ("ready", 30)]
         node._send_incident_ack(31)                       # the background path, as the chain uses it
         deadline = time.monotonic() + 5.0
@@ -522,3 +523,108 @@ def test_reports_go_out_through_real_actions(ros):
             server.destroy()
         node.destroy_node()
         ocs.destroy_node()
+
+
+def test_confirm_counts_when_an_earlier_report_try_may_have_gone_out(node):
+    """A failed try can reach RoboCommand under a seq we never learn; its confirm must still release the hold."""
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node)], respond=True)
+    h.report_seq, h.report_unsure = 413, True
+    node._on_confirm(confirm(report_seq=400))                       # before the goal: never counts
+    later(0.3, node._on_confirm, confirm(report_seq=412))           # the try we think failed
+    started = time.monotonic()
+    ok, circled, failed, message = h.run()
+    assert ok and "assistance request 30 confirmed" in message and time.monotonic() - started < 3.0
+
+
+def test_confirm_from_before_the_station_does_not_count_even_when_unsure(node):
+    def arrive():
+        node._on_assistance(assistance())
+        node._on_confirm(confirm(report_seq=390))                   # in this goal, but before we got on station
+        return True
+
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, arrive], respond=True)
+    h.report_seq, h.report_unsure = 413, True
+    node.readiness_confirm_timeout = 0.5
+    ok, circled, failed, message = h.run()
+    assert ok and "assistance request 30 confirm_timeout" in message
+
+
+def test_request_during_the_switch_back_is_answered_before_going_on(node):
+    other = [-20.0, -9.0]
+    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node, seq=30)], respond=True)
+    sent = []
+
+    def send_task(task, goal_handle=None):
+        sent.append(task)
+        if sent == ["dynamic_incident", "safe_passage"]:            # a second request lands during the switch back
+            node._on_assistance(assistance(seq=31, xy=other))
+    node._send_task = send_task
+    later(0.2, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and "assistance request 30 confirmed" in message and "assistance request 31 confirmed" in message
+    assert sent == ["dynamic_incident", "safe_passage", "dynamic_incident", "safe_passage"]
+    np.testing.assert_allclose(h.targets[2], STATION)
+    np.testing.assert_allclose(h.targets[3], other)
+    per = node.circle_points + node.circle_overshoot_points + 1
+    assert len(h.targets) == 2 + 2 + per                            # the buoy started over once, after both
+
+
+def test_blob_missing_from_one_costmap_does_not_move_the_circle(node):
+    truth = np.array([10.7, 0.0])
+    grid = costmap([truth])
+    h = Harness(node, [buoy("flashing_red", [10.0, 0.0])], boat=(0.0, 0.0))
+    node._snapshot = lambda: grid
+
+    def blob_gone():
+        node._aligner.buoy_blobs = np.zeros((0, 2))                 # the costmap cleared it for a moment
+        return True
+
+    h.results = [True, True, blob_gone]
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 1
+    radii = np.linalg.norm(np.array(h.targets) - truth, axis=1)
+    assert radii.max() - radii.min() < 0.15, radii                  # every point still around the blob
+
+
+def test_layout_locking_mid_circle_starts_the_buoy_over(node):
+    """No lock by the timeout, so the circle starts on the drone's position; the lock then moves it metres."""
+    shift = np.array([4.0, 0.0])
+    h = Harness(node, [buoy("flashing_red", [0.0, 0.0])])
+
+    def lock_now():
+        node._aligner.t, node._aligner.locked = shift.copy(), True
+        return True
+
+    h.results = [True, True, lock_now]
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 1 and "1 attempt(s)" in message         # the restart is not a failed attempt
+    per = node.circle_points + node.circle_overshoot_points + 1
+    assert h.phases().count("TRANSIT") == 2 and len(h.targets) == 3 + per
+    radii = np.linalg.norm(np.array(h.targets[3:]) - shift, axis=1)
+    assert radii.max() - radii.min() < 1e-6                           # a whole circle around where it really is
+
+
+def test_restarts_are_capped_then_points_are_only_re_placed(node):
+    node.buoy_restarts = 1
+    h = Harness(node, [buoy("flashing_red", [0.0, 0.0])])
+    jumps = iter([np.array([4.0, 0.0]), np.array([8.0, 0.0])])
+
+    def jump():
+        node._aligner.t = next(jumps)
+        return True
+
+    h.results = [True, jump, True, jump]
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 1 and h.phases().count("TRANSIT") == 2   # one restart, the second jump re-places
+
+
+def test_same_costmap_counts_once_towards_the_lock(node):
+    grid = costmap(LAYOUT + SHIFT)
+    node._aligner = ba.Aligner(LAYOUT, node.align_params)
+    for _ in range(5):
+        node._align_step(grid)
+    assert not node._aligner.locked                                   # one costmap, however often it is offered
+    for _ in range(2):
+        node._align_step(costmap(LAYOUT + SHIFT))
+    assert node._aligner.locked
+    node._aligner = None

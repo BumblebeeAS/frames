@@ -85,6 +85,10 @@ class Assistance(Exception):
     """An AssistanceRequest is waiting: drop what is being driven and answer it."""
 
 
+class Restart(Exception):
+    """The buoy turned out to be somewhere else entirely: start its circle over."""
+
+
 @dataclass
 class Incident:
     """One Task 4 Core AssistanceRequest and how far its answer got."""
@@ -96,6 +100,8 @@ class Incident:
     #                                     confirmed | confirm_timeout | unreachable | report_failed | no_position |
     #                                     superseded | canceled
     report_seq: Optional[int] = None    # seq of the report that carried our ReadinessReport
+    report_unsure: bool = False         # a try at that report failed: it may still have reached RoboCommand
+    on_station: Optional[float] = None  # monotonic, when the boat got there
     ended: Optional[float] = None
 
 
@@ -133,6 +139,8 @@ class SafePassageNode(Node):
 
         # Estimate and circle
         self.estimate_move_threshold = param("estimate_move_threshold", 0.3)
+        self.estimate_restart_threshold = param("estimate_restart_threshold", 1.5)
+        self.buoy_restarts = param("buoy_restarts", 2)
         self.circle_radius = param("circle_radius", 2.5)
         self.circle_radius_min = param("circle_radius_min", 1.6)
         self.circle_radius_step = param("circle_radius_step", 0.25)
@@ -174,6 +182,7 @@ class SafePassageNode(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self._grid: Optional[geo.CostGrid] = None
+        self._solved_grid: Optional[geo.CostGrid] = None  # the last costmap the running goal's aligner saw
         self.create_subscription(OccupancyGrid, self.costmap_topic, self._on_costmap, LATCHED_QOS,
                                  callback_group=self.costmap_group)
         self.create_subscription(AssistanceRequest, param("assistance_topic", "/asv5/task4/assistance_request"),
@@ -197,7 +206,7 @@ class SafePassageNode(Node):
         self._pending: Optional[Incident] = None      # accepted, not yet picked up by the goal thread
         self._incident: Optional[Incident] = None     # being answered
         self._incidents: list[Incident] = []          # of the running goal, in order, for its result
-        self._confirms: dict[int, int] = {}           # report_seq -> ReadinessConfirm seq, for this vehicle
+        self._confirms: dict[int, float] = {}         # report_seq -> when its ReadinessConfirm for us arrived
 
         self.track_path_name = param("track_path_action", "/asv5/track_path")
         self.track_path = ActionClient(self, TrackPath, self.track_path_name, callback_group=self.cb_group)
@@ -273,7 +282,7 @@ class SafePassageNode(Node):
             return None
         aligner = ba.Aligner([b.xy for b in buoys], self.align_params)
         with self._lock:
-            self._aligner, self._buoys, self._logged_t = aligner, buoys, np.zeros(2)
+            self._aligner, self._buoys, self._logged_t, self._solved_grid = aligner, buoys, np.zeros(2), None
         self.get_logger().info(
             "Safe Passage buoys: " + ", ".join(f"{b.index}:{b.state}({b.xy[0]:.1f},{b.xy[1]:.1f})" for b in buoys)
             + f"; tightest spacing {float(aligner.nn.min()):.2f} m; respond_to_assistance {self._respond}")
@@ -329,11 +338,16 @@ class SafePassageNode(Node):
         self._align_step(self._snapshot())  # the costmap already here; later ones arrive through _on_costmap
         start = time.monotonic()
 
+        shown = [None]
+
         def locked():
             self._check(goal_handle)
             with self._lock:
                 matched, done = self._aligner.matched, self._aligner.locked
-            goal_handle.publish_feedback(SafePassage.Feedback(phase="ALIGN", buoy_total=total, shift_inliers=matched))
+            if matched != shown[0]:
+                shown[0] = matched
+                goal_handle.publish_feedback(SafePassage.Feedback(phase="ALIGN", buoy_total=total,
+                                                                  shift_inliers=matched))
             return done
 
         if self.align_timeout > 0.0 and self._wait(goal_handle, locked, self.align_timeout):
@@ -352,8 +366,9 @@ class SafePassageNode(Node):
         """One costmap through the aligner of the running goal, logged."""
         with self._lock:
             aligner = self._aligner
-        if aligner is None:
-            return
+            if aligner is None or grid is self._solved_grid:  # nothing running, or this costmap already counted
+                return
+            self._solved_grid = grid
         started = time.monotonic()
         all_blobs = ba.blobs(grid, aligner.candidates, aligner.reach(), aligner.p.join_gap)
         with self._lock:
@@ -384,14 +399,19 @@ class SafePassageNode(Node):
     # One buoy
 
     def _do_buoy(self, goal_handle, buoy: Buoy, position: int, total: int):
+        restarts = 0
         while buoy.attempts < self.buoy_attempts:
             buoy.attempts += 1
             label = f"Buoy {buoy.index} ({buoy.state}) attempt {buoy.attempts}/{self.buoy_attempts}"
             try:
-                ok = self._attempt(goal_handle, buoy, label, position, total)
+                ok = self._attempt(goal_handle, buoy, label, position, total, restarts < self.buoy_restarts)
             except Assistance:
                 buoy.attempts -= 1  # an incident is not a failed attempt: the buoy starts over afterwards
                 self._answer_assistance(goal_handle, total)
+                continue
+            except Restart:
+                buoy.attempts -= 1  # nor is finding the buoy elsewhere (the layout locked late, say)
+                restarts += 1
                 continue
             if ok:
                 buoy.status = "circled"
@@ -400,7 +420,8 @@ class SafePassageNode(Node):
             self.get_logger().warning(f"{label}: failed")
         buoy.status = "failed"
 
-    def _attempt(self, goal_handle, buoy: Buoy, label: str, position: int, total: int) -> bool:
+    def _attempt(self, goal_handle, buoy: Buoy, label: str, position: int, total: int,
+                 may_restart: bool = True) -> bool:
         estimate = self._estimate(buoy)
         boat = self._boat_xy()
         if boat is None:
@@ -429,11 +450,21 @@ class SafePassageNode(Node):
         for k in range(len(points)):
             for retry in range(1 + max(0, int(self.point_retries))):
                 if k > 0 or retry > 0:
-                    estimate = self._estimate(buoy)
-                    if np.linalg.norm(estimate.xy - centre) > self.estimate_move_threshold or retry > 0:
-                        if np.linalg.norm(estimate.xy - centre) > 1e-6:
+                    fresh, held = self._estimate(buoy), buoy.estimate
+                    if (fresh.source == ba.PREDICTED and held.source == ba.BLOB
+                            and np.linalg.norm(fresh.predicted - held.xy) <= fresh.radius):
+                        fresh = held  # this costmap misses the blob we are circling: it has not moved
+                    estimate = fresh
+                    moved = float(np.linalg.norm(estimate.xy - centre))
+                    if may_restart and moved > self.estimate_restart_threshold:
+                        # Points driven so far were around the wrong place: the rest would not enclose the buoy
+                        self.get_logger().warning(f"{label}: centre moved {moved:.2f} m ({estimate.source}) at "
+                                                  f"point {k}: starting this buoy over")
+                        raise Restart()
+                    if moved > self.estimate_move_threshold or retry > 0:
+                        if moved > 1e-6:
                             self.get_logger().info(
-                                f"{label}: centre moved {np.linalg.norm(estimate.xy - centre):.2f} m "
+                                f"{label}: centre moved {moved:.2f} m "
                                 f"({estimate.source}), points re-placed")
                         centre, points = estimate.xy, place(estimate.xy)
                         buoy.estimate = estimate
@@ -536,7 +567,8 @@ class SafePassageNode(Node):
             return
         with self._lock:
             new = msg.report_seq not in self._confirms
-            self._confirms[msg.report_seq] = msg.seq  # kept: it may arrive before we know our report's seq
+            if new:  # kept with its arrival time: it may arrive before we know our report's seq
+                self._confirms[msg.report_seq] = time.monotonic()
         if new:
             self.get_logger().info(f"Readiness confirm {msg.seq} for report {msg.report_seq} received")
 
@@ -546,31 +578,35 @@ class SafePassageNode(Node):
 
     def _answer_assistance(self, goal_handle, total: int):
         """Answer every waiting request, newest last, then switch the task back. Raises Canceled."""
-        answered = False
         while True:
-            with self._lock:
-                incident, self._pending = self._pending, None
-                self._incident = incident
-            if incident is None:
-                break
-            answered = True
-            try:
-                outcome = self._respond_to(goal_handle, incident, total)
-            except Assistance:  # a newer request arrived while this one was being answered
-                outcome = "superseded"
-            with self._lock:
-                self._end(incident, outcome)
-                self._incident = None
-                self._target = None
-            took = incident.ended - incident.received
-            if outcome == "confirmed":
-                self.get_logger().info(f"Assistance request {incident.seq}: confirmed after {took:.0f} s")
-            else:
-                self.get_logger().warning(f"Assistance request {incident.seq}: {outcome} after {took:.0f} s")
-        if answered:
+            answered = False
+            while True:
+                with self._lock:
+                    incident, self._pending = self._pending, None
+                    self._incident = incident
+                if incident is None:
+                    break
+                answered = True
+                try:
+                    outcome = self._respond_to(goal_handle, incident, total)
+                except Assistance:  # a newer request arrived while this one was being answered
+                    outcome = "superseded"
+                with self._lock:
+                    self._end(incident, outcome)
+                    self._incident = None
+                    self._target = None
+                took = incident.ended - incident.received
+                if outcome == "confirmed":
+                    self.get_logger().info(f"Assistance request {incident.seq}: confirmed after {took:.0f} s")
+                else:
+                    self.get_logger().warning(f"Assistance request {incident.seq}: {outcome} after {took:.0f} s")
+            if not answered:
+                return
             # Waited for, so it cannot land after a task the mission tree sets once this goal returns
             self._send_task(self.resume_task, goal_handle)
-            self.get_logger().info("Back to Safe Passage: the interrupted step starts over")
+            if self._pending is None:  # else one more came in during that switch: answer it before going on
+                self.get_logger().info("Back to Safe Passage: the interrupted step starts over")
+                return
 
     def _respond_to(self, goal_handle, incident: Incident, total: int) -> str:
         """Ack, go there, report ready, wait for the confirm. Returns how it ended. Raises Assistance or Canceled."""
@@ -601,19 +637,27 @@ class SafePassageNode(Node):
             return "unreachable"
 
         state("on_station", "INCIDENT_ON_STATION")
-        report_seq = self._send_readiness(goal_handle, seq)
+        with self._lock:
+            incident.on_station = time.monotonic()
+        report_seq, unsure = self._send_readiness(goal_handle, seq)
         if report_seq is None:
             self.get_logger().error(f"Assistance request {seq}: on station but the ReadinessReport did not go out")
             return "report_failed"
         with self._lock:
-            incident.report_seq = report_seq
-        self.get_logger().info(f"Assistance request {seq}: on station, ReadinessReport sent as report {report_seq}; "
-                               f"holding for its ReadinessConfirm, up to {self.readiness_confirm_timeout:.0f} s")
+            incident.report_seq, incident.report_unsure = report_seq, unsure
+        self.get_logger().info(
+            f"Assistance request {seq}: on station, ReadinessReport sent as report {report_seq}; holding for its "
+            f"ReadinessConfirm, up to {self.readiness_confirm_timeout:.0f} s"
+            + (". An earlier try failed and may have reached RoboCommand under another seq: any confirm for "
+               f"{self.vehicle_id} from now on counts" if unsure else ""))
 
         def confirmed():
             self._check(goal_handle)
             with self._lock:
-                return report_seq in self._confirms
+                if report_seq in self._confirms:
+                    return True
+                # A failed try may have gone out under a seq we never learned, and that is the one confirmed
+                return unsure and any(at >= incident.on_station for at in self._confirms.values())
 
         if self._wait(goal_handle, confirmed, self.readiness_confirm_timeout):
             return "confirmed"
@@ -637,10 +681,11 @@ class SafePassageNode(Node):
         self._send_with_retries(self.set_task, self.set_task_name, SetTask.Goal(task=task), f"SetTask {task}",
                                 stale, background=goal_handle is None)
 
-    def _send_readiness(self, goal_handle, seq: int) -> Optional[int]:
-        """Send the ReadinessReport, retried; returns the seq of the report that carried it."""
+    def _send_readiness(self, goal_handle, seq: int) -> tuple[Optional[int], bool]:
+        """Send the ReadinessReport, retried. Returns (seq of the report that carried it, whether a try failed)."""
         goal = SendReadinessReport.Goal()
         goal.report.command_seq = seq
+        unsure = False
         for attempt in range(1, 2 + max(0, int(self.report_retries))):
             sent = {}
 
@@ -649,9 +694,10 @@ class SafePassageNode(Node):
                 return not result.error
 
             if self._run_action(goal_handle, self.readiness, self.readiness_name, goal, self.report_timeout, ok):
-                return int(sent["seq"])
+                return int(sent["seq"]), unsure
+            unsure = True
             self.get_logger().warning(f"ReadinessReport for {seq}: attempt {attempt} failed")
-        return None
+        return None, unsure
 
     def _send_with_retries(self, client: ActionClient, name: str, goal, what: str, stale: Callable[[], bool],
                            background: bool):

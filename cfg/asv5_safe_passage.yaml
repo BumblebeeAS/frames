@@ -38,6 +38,8 @@ safe_passage_node:
     snap_spacing_factor: 0.5       # r_i also <= this x the distance to the nearest other drone buoy
     claim_radius: 1.0              # blobs this close to a circled buoy are off limits
     estimate_move_threshold: 0.3   # remaining circle points move only when E_i moves more than this
+    estimate_restart_threshold: 1.5  # E_i moving more than this mid-circle (a late lock) starts the buoy over
+    buoy_restarts: 2               # at most this often per buoy; after that the points are only re-placed
 
     # Circle: start point + circle_points per 360 deg + overshoot
     circle_radius: 2.5

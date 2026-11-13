@@ -1,5 +1,5 @@
 # RobotX 2026 Task 1 (Safe Passage) on asv5: scripts/safe_passage_node.py, action /asv5/safe_passage.
-# Goal: the drone's buoys (lat/lon + state). Planning in asv5/map (ENU); circles are stop-and-go TrackPath goals.
+# Goal: the drone's buoys (lat/lon + state). Planning in asv5/map (ENU); the route is stop-and-go TrackPath goals.
 # Buoys are located on the costmap below: no lidar topic of its own.
 safe_passage_node:
   ros__parameters:
@@ -31,50 +31,46 @@ safe_passage_node:
     lock_tolerance: 0.5            # 1.0 locked up to 1.5 m off while the costmap wobbled with localisation
     basin: 2.0                     # once locked, only shifts this close to the locked one are searched
     median_window: 10
-    align_timeout: 30.0            # ALIGN holds this long for a lock, then goes on with the drone's positions as is
+    align_timeout: 60.0            # ALIGN holds this long for a lock, then goes on with the drone's positions as is
 
     # Buoy estimate E_i: nearest unclaimed buoy-sized blob within r_i of P_i = C_i + t, else P_i
     snap_radius: 1.0               # r_i
     snap_spacing_factor: 0.5       # r_i also <= this x the distance to the nearest other drone buoy
-    claim_radius: 1.0              # blobs this close to a circled buoy are off limits
-    estimate_move_threshold: 0.3   # remaining circle points move only when E_i moves more than this
-    estimate_restart_threshold: 1.5  # E_i moving more than this mid-circle (a late lock) starts the buoy over
-    buoy_restarts: 2               # at most this often per buoy; after that the points are only re-placed
+    claim_radius: 1.0              # blobs this close to a buoy already placed are off limits
 
-    # Circle (entry, exit): start point + circle_points per 360 deg + overshoot
-    circle_radius: 2.5
-    circle_radius_min: 1.6         # tracker cost boundary ~1.05 m from a buoy mark, plus margin
-    circle_radius_step: 0.25
+    # Route (frames/utils/safe_route.py): entry loop clockwise, a transit that never passes a red to port or a
+    # green to starboard and passes one of each on the right side where the field allows, exit circle
+    # counterclockwise. Planned once after ALIGN, and again from the boat when a goal fails every try or a Task 4
+    # request has been answered. The planner's own margins are its defaults (RouteParams).
+    circle_radius: 2.5             # entry and exit circles: nominal ...
+    circle_radius_min: 1.6         # ... and smallest radius
     neighbour_clearance: 1.25      # R <= nearest other buoy - this (robot radius 0.75 + 0.5)
-    circle_points: 6               # 60 deg apart: the straight leg between two passes 0.87 x R from the centre
-    circle_overshoot_points: 1
-    # Reds and greens are passed, not circled. The course runs from the entry to the exit (to the middle of the
-    # reds and greens when no exit is known); they are visited in order along it.
-    pass_points: 0                 # 0: one waypoint beside the buoy. > 0: that many circle steps from a tangent
-                                   # start point instead (3 of 6 is a semicircle)
-    pass_offset: 1.8               # waypoint this far beside the buoy: left of a red, right of a green, along the
-                                   # course. Less when another buoy is close (neighbour_clearance), at least 1.2
-    gate_min_width: 2.4            # a red and a green this far apart ...
-    gate_max_width: 6.0
-    gate_max_angle: 60.0           # ... facing within this of the course are a gate: one waypoint midway for both
-    cost_threshold: 22             # = tracker sample_cost_threshold: a circle point at or above is blocked
+    circle_points: 6               # goals per lap, 60 deg apart
+    plan_retry_period: 2.0         # no route: planned again this long after, on the costmap of then, with no limit
+    # What the planner is told about the field
+    blob_sigma: 0.3                # position error of a buoy on its costmap blob
+    predicted_sigma: 1.0           # ... of one with no blob, at its shifted drone position: a wider berth, and it
+                                   # earns no pass
+    unreported_margin: 4.0         # buoy-sized blobs no drone buoy sits on count this far around the drone's buoys:
+                                   # kept clear of, colourless
+    blob_cell_radius: 0.9          # lethal cells this close to a buoy-sized blob are that buoy, not an obstacle
+    obstacle_range: 14.0           # lethal cells further than this from every buoy are left out
 
-    # TrackPath (replan tracker), one goal at a time, specified_heading false, heading along the circle
+    # TrackPath (replan tracker), one goal at a time, specified_heading false, heading of the next leg
     goal_tolerance: 1.0
     goal_stabilize: 0
     goal_sample_radius: 0.5        # tracker moves a blocked goal this far; < 0.25 (its sample_spacing) does nothing
     max_replans: 5
-    goal_timeout: 60.0             # our backstop per goal
+    goal_timeout: 60.0             # our backstop per goal, plus its distance / goal_speed
+    goal_speed: 0.3                # m/s (the boat makes about 0.44)
 
     # Retries
-    point_retries: 1               # a failed point is re-placed and retried this many times, then skipped
-    max_consecutive_skips: 2       # skips in a row that fail the attempt (one skip keeps the buoy enclosed)
-    buoy_attempts: 2
-    requeue_failed: true           # failed reds and greens get one more attempt before the exit
+    point_retries: 2               # a failed goal is sent again this many times, then the node plans again from
+                                   # where the boat is
 
     # Task 4 Core (goal respond_to_assistance): an AssistanceRequest for this vehicle type interrupts the goal.
     # IncidentAck + SetTask go out, the boat drives to the position, sends the ReadinessReport, holds for the
-    # ReadinessConfirm naming that report, then SetTask back and the interrupted buoy starts over.
+    # ReadinessConfirm naming that report, then drives back to where it was interrupted, SetTask back, and PLAN.
     hold_idle_requests: true       # a request with no goal answering is held, with no time limit, for the next goal
     clear_assistance_service: "/asv5/safe_passage/clear_assistance"  # Trigger: drops it (the tree, at run start)
     vehicle_id: "USV1"             # as the OCS names this vehicle: ReadinessConfirms for another id are ignored
@@ -90,6 +86,8 @@ safe_passage_node:
     incident_tolerance: 1.0        # on station within this of the requested position
     incident_goal_timeout: 300.0   # per try at reaching it (goal_timeout is sized for circle points)
     incident_goal_retries: 2       # more tries at reaching it; unreached: no ReadinessReport, back to the buoys
+    incident_return: true          # afterwards drive back to where the boat was interrupted before planning again
+                                   # (planned from outside the field, 1 layout in 10 had no route)
     readiness_confirm_timeout: 900.0   # hold this long for the ReadinessConfirm, then resume anyway
     report_retries: 3              # more tries for IncidentAck, SetTask and ReadinessReport
     report_timeout: 40.0           # per try; the bridge gives the OCS 30 s

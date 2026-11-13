@@ -1,20 +1,16 @@
 """Safe Passage geometry on a costmap snapshot, free of ROS so it can be tested offline.
 
-All positions are 2D in the costmap's global frame (asv5/map, ENU). Angles are ENU: radians, anticlockwise from
-east. sigma is the circling direction: +1 clockwise seen from above, -1 counterclockwise.
+All positions are 2D in the costmap's global frame (asv5/map, ENU). The route itself is frames.utils.safe_route.
 """
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Sequence
 
 import numpy as np
 
 LETHAL = 100  # nav_msgs/OccupancyGrid scale: 100 lethal, 99 inscribed, -1 unknown
 
 ENTRY, EXIT, RED, GREEN, BLACK = "flashing_blue", "steady_blue", "flashing_red", "flashing_green", "off"
-# Circling direction per state: entry and red clockwise (red stays on starboard), green and exit counterclockwise
-SIGMA = {ENTRY: 1, RED: 1, GREEN: -1, EXIT: -1}
 
 
 @dataclass
@@ -55,89 +51,12 @@ class CostGrid:
         out[inside] = self.data[row[inside], col[inside]]
         return np.maximum(out, 0)
 
-
-def course(positions: Sequence, states: Sequence[str], boat) -> tuple[np.ndarray, Optional[np.ndarray]]:
-    """Where the course starts and its direction (unit vector), or None when it has none.
-
-    From the entry (else the boat) to the exit (else the reds' and greens' centroid). Reds are left to starboard
-    and greens to port going this way.
-    """
-    positions = [np.asarray(p, dtype=float)[:2] for p in positions]
-    entry = next((i for i, s in enumerate(states) if s == ENTRY), None)
-    exit_ = next((i for i, s in enumerate(states) if s == EXIT), None)
-    middle = [i for i, s in enumerate(states) if s in (RED, GREEN)]
-    start = positions[entry] if entry is not None else np.asarray(boat, dtype=float)[:2]
-    if exit_ is not None:
-        end = positions[exit_]
-    elif middle:
-        end = np.mean([positions[i] for i in middle], axis=0)
-    else:
-        end = start
-    axis = end - start
-    length = float(np.linalg.norm(axis))
-    return start, (axis / length if length > 1.0 else None)
-
-
-def order_buoys(positions: Sequence, states: Sequence[str], boat) -> list[int]:
-    """Circling order: the entry, the reds and greens, the exit. Black buoys are left out.
-
-    Reds and greens are sorted along the course (see course()). Without a course they go nearest-next from the start.
-    """
-    positions = [np.asarray(p, dtype=float)[:2] for p in positions]
-    entry = next((i for i, s in enumerate(states) if s == ENTRY), None)
-    exit_ = next((i for i, s in enumerate(states) if s == EXIT), None)
-    middle = [i for i, s in enumerate(states) if s in (RED, GREEN)]
-    start, direction = course(positions, states, boat)
-    if direction is not None:
-        middle.sort(key=lambda i: float(np.dot(positions[i] - start, direction)))
-    else:
-        ordered, at = [], start
-        while middle:
-            nearest = min(middle, key=lambda i: float(np.linalg.norm(positions[i] - at)))
-            middle.remove(nearest)
-            ordered.append(nearest)
-            at = positions[nearest]
-        middle = ordered
-    return ([entry] if entry is not None else []) + middle + ([exit_] if exit_ is not None else [])
-
-
-def pass_waypoint(centre, state: str, direction, offset: float) -> np.ndarray:
-    """The point beside a red or green buoy that passes it on the right side going along direction.
-
-    Left of a red (it stays on starboard), right of a green (it stays on port).
-    """
-    direction = np.asarray(direction, dtype=float)[:2]
-    left = np.array([-direction[1], direction[0]])
-    return np.asarray(centre, dtype=float)[:2] + (left if state == RED else -left) * offset
-
-
-def find_gates(positions: Sequence, states: Sequence[str], direction, min_width: float, max_width: float,
-               max_angle: float) -> list[tuple[int, int]]:
-    """(red, green) pairs to cross between as one manoeuvre, narrowest first, each buoy in at most one.
-
-    A pair is a gate when it is min_width to max_width apart and crossing it with the red on starboard is within
-    max_angle (rad) of direction: going along the course then passes both on the right side at once.
-    """
-    positions = [np.asarray(p, dtype=float)[:2] for p in positions]
-    direction = np.asarray(direction, dtype=float)[:2]
-    candidates = []
-    for r, sr in enumerate(states):
-        for g, sg in enumerate(states):
-            if sr != RED or sg != GREEN:
-                continue
-            across = positions[g] - positions[r]
-            width = float(np.linalg.norm(across))
-            if not min_width <= width <= max_width:
-                continue
-            crossing = np.array([across[1], -across[0]]) / width   # red on starboard, green on port
-            if math.acos(max(-1.0, min(1.0, float(crossing @ direction)))) <= max_angle:
-                candidates.append((width, r, g))
-    gates, used = [], set()
-    for _, r, g in sorted(candidates):
-        if r not in used and g not in used:
-            gates.append((r, g))
-            used.update((r, g))
-    return gates
+    def lethal_points(self) -> np.ndarray:
+        """(N, 2) centres of the lethal cells."""
+        rows, cols = np.nonzero(self.data >= LETHAL)
+        gx, gy = (cols + 0.5) * self.resolution, (rows + 0.5) * self.resolution
+        c, s = math.cos(self.origin_yaw), math.sin(self.origin_yaw)
+        return np.stack([self.origin_x + c * gx - s * gy, self.origin_y + s * gx + c * gy], axis=1)
 
 
 def nearest_other(points) -> np.ndarray:
@@ -148,70 +67,3 @@ def nearest_other(points) -> np.ndarray:
     d = np.linalg.norm(points[:, None, :] - points[None, :, :], axis=2)
     np.fill_diagonal(d, np.inf)
     return d.min(axis=1)
-
-
-def tangent_point(centre, radius: float, start, clockwise: bool) -> np.ndarray:
-    """Where a vehicle at start joins the circle tangentially in the given direction.
-
-    From inside or on the circle it joins radially, along its bearing from the centre.
-    """
-    centre, start = np.asarray(centre, dtype=float)[:2], np.asarray(start, dtype=float)[:2]
-    offset = start - centre
-    r0 = float(np.linalg.norm(offset))
-    phi0 = math.atan2(offset[1], offset[0]) if r0 > 0 else 0.0
-    phi = phi0 - (1.0 if clockwise else -1.0) * math.acos(radius / r0) if r0 > radius else phi0
-    return centre + radius * np.array([math.cos(phi), math.sin(phi)])
-
-
-def start_angle(centre, radius: float, boat, sigma: int) -> float:
-    """Bearing from centre of the point the boat joins the circle at: the tangent point, or radially from inside."""
-    point = tangent_point(centre, radius, boat, sigma > 0) - np.asarray(centre, dtype=float)[:2]
-    return math.atan2(point[1], point[0])
-
-
-def circle_points(centre, radius: float, phi0: float, sigma: int, n: int, overshoot: int = 0,
-                  steps: Optional[int] = None) -> list:
-    """[(xy, yaw), ...] for k = 0 .. n + overshoot: point k at phi0 - sigma * k * 2 pi / n, yaw along the travel.
-
-    steps, when given, replaces n + overshoot: an arc of that many steps of 2 pi / n (n / 2 is a semicircle).
-    """
-    centre = np.asarray(centre, dtype=float)[:2]
-    out = []
-    for k in range((n + overshoot if steps is None else steps) + 1):
-        phi = phi0 - sigma * k * 2.0 * math.pi / n
-        out.append((centre + radius * np.array([math.cos(phi), math.sin(phi)]), phi - sigma * math.pi / 2.0))
-    return out
-
-
-def circle_angles(n: int, offset: float = 0.0) -> np.ndarray:
-    return offset + np.linspace(0.0, 2.0 * math.pi, n, endpoint=False)
-
-
-def choose_radius(grid: CostGrid, centre, neighbours, nominal: float, minimum: float, step: float,
-                  clearance: float, threshold: int, check_points: int = 16) -> tuple[float, str]:
-    """Circle radius around centre and why.
-
-    Starts at nominal, capped at (nearest neighbour - clearance) and floored at minimum, then shrinks by step while
-    any of check_points evenly spaced points on the circle costs threshold or more, never below minimum.
-    """
-    centre = np.asarray(centre, dtype=float)[:2]
-    radius, why = nominal, "nominal"
-    neighbours = np.atleast_2d(np.asarray(neighbours, dtype=float)) if len(neighbours) else np.zeros((0, 2))
-    if len(neighbours):
-        nearest = float(np.linalg.norm(neighbours[:, :2] - centre, axis=1).min())
-        if nearest - clearance < radius:
-            radius, why = nearest - clearance, f"neighbour {nearest:.2f} m"
-    if radius < minimum:
-        radius, why = minimum, why + ", floored at minimum"
-
-    def blocked(r):
-        angles = circle_angles(check_points)
-        points = centre + r * np.stack([np.cos(angles), np.sin(angles)], axis=1)
-        return int(grid.cost(points).max()) >= threshold
-
-    while blocked(radius):
-        if radius <= minimum + 1e-9:
-            return radius, why + ", still blocked at minimum"
-        radius = max(radius - step, minimum)
-        why += f", shrunk to {radius:.2f} m for cost"
-    return radius, why

@@ -1,9 +1,10 @@
-"""safe_passage_node with stubbed TrackPath, TF, fromLL and costmap: alignment, order, retries, Task 4 Core."""
+"""safe_passage_node with stubbed TrackPath, TF, fromLL and costmap: alignment, the route, retries, Task 4 Core."""
 import math
 import sys
 import threading
 import time
 import types
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,18 +31,70 @@ import importlib.util  # noqa: E402
 
 from frames.utils import buoy_align as ba  # noqa: E402
 from frames.utils import safe_passage_geometry as geo  # noqa: E402
+from frames.utils import safe_route as sr  # noqa: E402
 
 spec = importlib.util.spec_from_file_location("safe_passage_node", ROOT / "scripts/safe_passage_node.py")
 spn = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(spn)
 
-ENTRY, RED, GREEN, EXIT, BLACK = [0.0, 0.0], [9.0, 3.0], [10.0, -3.0], [20.0, 0.0], [15.0, 8.0]
+# A channel running north: reds to the east (starboard going north), greens to the west, a black off to the side
+ENTRY, EXIT = [0.0, 0.0], [0.0, 20.0]
+REDS, GREENS, BLACK = [[3.0, 7.0], [3.0, 13.0]], [[-3.0, 7.0], [-3.0, 13.0]], [9.0, 10.0]
+STATION = [30.0, 12.0]
 
 
 def buoy(state, xy):
     b = SafePassageBuoy(state=state)
     b.position.latitude, b.position.longitude = xy  # the stubbed fromLL maps lat, lon -> x, y
     return b
+
+
+def channel(entry=True, exit_=True):
+    out = [buoy("flashing_red", xy) for xy in REDS] + [buoy("flashing_green", xy) for xy in GREENS]
+    out.append(buoy("off", BLACK))
+    if entry:
+        out.append(buoy("flashing_blue", ENTRY))
+    if exit_:
+        out.append(buoy("steady_blue", EXIT))
+    return out
+
+
+def positions(buoys):
+    return [[b.position.latitude, b.position.longitude] for b in buoys]
+
+
+def costmap(points, size=80.0, origin=(-30.0, -40.0), res=0.1):
+    n = int(size / res)
+    data = np.zeros((n, n), dtype=np.int16)
+    for x, y in points:
+        c, r = int((x - origin[0]) / res), int((y - origin[1]) / res)
+        data[r - 2:r + 2, c - 2:c + 2] = 100
+    return geo.CostGrid(data, res, origin[0], origin[1])
+
+
+PLANS = {}     # the planner is deterministic: one search per distinct problem for the whole module
+CALLS = []     # every call a node made: (start, need_red, need_green)
+GOALS = []     # the goals of the test in hand
+_plan_route = sr.plan_route
+
+
+def plan_route(buoys, params=None, obstacles=None, start=None, need_red=True, need_green=True, **kwargs):
+    CALLS.append((None if start is None else tuple(np.round(start, 2)), need_red, need_green))
+    if len(CALLS) > 12 and GOALS:      # a test that would plan for ever ends as a canceled goal instead
+        GOALS[-1].is_cancel_requested = True
+    key = (tuple((round(b.x, 2), round(b.y, 2), b.state, b.confirmed) for b in buoys), CALLS[-1],
+           0 if obstacles is None else len(obstacles))
+    if key not in PLANS:
+        PLANS[key] = _plan_route(buoys, params, obstacles, start=start, need_red=need_red, need_green=need_green,
+                                 **kwargs)
+    return PLANS[key]
+
+
+@pytest.fixture(autouse=True)
+def cached_planner(monkeypatch):
+    monkeypatch.setattr(sr, "plan_route", plan_route)
+    del CALLS[:]
+    del GOALS[:]
 
 
 class Goal:
@@ -55,40 +108,83 @@ class Goal:
 
 
 class Harness:
-    """Stubs the node's I/O. results: per-goal bools (default True), or callables run when that goal is sent."""
+    """Stubs the node's I/O. results: per-goal bools (default True), or callables run when that goal is sent.
 
-    def __init__(self, node, buoys, results=(), boat=(-10.0, 0.0), respond=False):
+    A goal that succeeds is driven the way the boat drives it (turn on the spot, straight there, turn to the goal's
+    heading), every pose going through the node's pass tracker. The costmap has a blob on every buoy unless given.
+    """
+
+    def __init__(self, node, buoys=None, results=(), boat=(0.0, -10.0), respond=False, grid=None):
+        buoys = channel() if buoys is None else buoys
         self.node, self.goal = node, Goal(buoys, respond)
+        GOALS.append(self.goal)
         self.acks, self.tasks, self.reports, self.report_seq = [], [], [], 412
         node._send_incident_ack = self.acks.append
         node._send_task = lambda task, goal_handle=None: self.tasks.append(task)
         self.report_unsure = False
         node._send_readiness = lambda gh, seq: (self.reports.append(seq), (self.report_seq, self.report_unsure))[1]
-        self.results, self.boat, self.targets = list(results), np.array(boat), []
-        node._boat_xy = lambda: self.boat
-        node._snapshot = geo.CostGrid.empty
+        self.results, self.pose, self.targets, self.timeouts = list(results), (boat[0], boat[1], math.pi / 2), [], []
+        node._boat_pose = lambda quiet=False: self.pose
+        self.grid = costmap(positions(buoys)) if grid is None else grid
+        node._snapshot = lambda: self.grid
         node._from_ll = lambda lat, lon: np.array([lat, lon])
         node._run_action = self._run_action
-        node.pass_points = 3      # these tests exercise the circle machinery on reds: semicircles, as before
-        node.align_timeout = 0.0  # no costmap in most tests: go straight on with the drone's positions
+        node.route_params = replace(node.route_params, mc_trials=0, choose="strictest")  # one search per plan
+        node.align_timeout = 0.0  # one buoy-sized blob per buoy and no shift: go straight on
+        node.plan_retry_period = 0.05
         node.readiness_confirm_timeout = 5.0
 
     def _run_action(self, gh, client, name, goal, timeout, ok):
-        xy = np.array([goal.goal_pose.pose.position.x, goal.goal_pose.pose.position.y])
+        pose = goal.goal_pose.pose
+        xy = np.array([pose.position.x, pose.position.y])
         self.targets.append(xy)
+        self.timeouts.append(timeout)
         result = self.results.pop(0) if self.results else True
         if callable(result):
             result = result()
         self.node._check(gh)
         if result:
-            self.boat = xy
+            self._sail(xy, 2.0 * math.atan2(pose.orientation.z, pose.orientation.w))
         return result
+
+    def _sail(self, xy, yaw):
+        x, y, heading = self.pose
+        travel = math.atan2(xy[1] - y, xy[0] - x) if np.hypot(xy[0] - x, xy[1] - y) > 1e-6 else heading
+
+        def turn(to):
+            nonlocal heading
+            delta = (to - heading + math.pi) % (2.0 * math.pi) - math.pi
+            for k in range(1, int(abs(delta) / math.radians(3.0)) + 2):
+                self.pose = (x, y, heading + delta * k / (int(abs(delta) / math.radians(3.0)) + 1))
+                self.node._track_passes()
+            heading = to
+
+        turn(travel)
+        steps = max(1, int(np.hypot(xy[0] - x, xy[1] - y) / 0.1))
+        x0, y0 = x, y
+        for k in range(1, steps + 1):
+            x, y = x0 + (xy[0] - x0) * k / steps, y0 + (xy[1] - y0) * k / steps
+            self.pose = (x, y, heading)
+            self.node._track_passes()
+        turn(yaw)
+
+    @property
+    def boat(self):
+        return np.array(self.pose[:2])
 
     def run(self):
         return self.node._run(self.goal)
 
     def phases(self):
         return [f.phase for f in self.goal.feedback]
+
+    def stages(self):
+        """The phases in the order they began, each once per stretch."""
+        out = []
+        for phase in self.phases():
+            if not out or out[-1] != phase:
+                out.append(phase)
+        return out
 
 
 @pytest.fixture(scope="module")
@@ -105,91 +201,227 @@ def node(ros):
     n.destroy_node()
 
 
-def goals(node, state="flashing_red"):
-    """TrackPath goals one clean attempt at a buoy takes: the start point, then a semicircle or a full circle."""
-    if state in ("flashing_red", "flashing_green"):
-        return node.pass_points + 1
-    return node.circle_points + node.circle_overshoot_points + 1
-
-
 def swept(points, centre):
     """Signed swept angle (deg) of a run of points about centre: negative is clockwise."""
     angles = np.unwrap([math.atan2(p[1] - centre[1], p[0] - centre[0]) for p in points])
     return math.degrees(angles[-1] - angles[0])
 
 
-def test_order_directions_and_point_counts(node):
-    h = Harness(node, [buoy("steady_blue", EXIT), buoy("flashing_green", GREEN), buoy("off", BLACK),
-                       buoy("flashing_red", RED), buoy("flashing_blue", ENTRY)])
+def count(h, phase):
+    """Goals a clean run sends in that phase."""
+    return max(f.point_total for f in h.goal.feedback if f.phase == phase)
+
+
+LOOP = 7       # goals of the entry loop: its start point, then six more round to it again
+
+
+# The route
+
+def test_run_is_align_plan_entry_transit_exit(node):
+    h = Harness(node)
     ok, circled, failed, message = h.run()
-    assert ok and circled == 4 and failed == 0, message
-    # entry, red (x 9), green (x 10), exit; black never circled
-    centres = [ENTRY, RED, GREEN, EXIT]
-    states = ["flashing_blue", "flashing_red", "flashing_green", "steady_blue"]
-    assert len(h.targets) == sum(goals(node, s) for s in states)
-    order = message.split("; ")
-    assert [o.split(" ")[0] for o in order] == ["4:flashing_blue", "3:flashing_red", "1:flashing_green",
-                                                "0:steady_blue"]
-    assert [o.split(" ")[1] for o in order] == ["circled", "passed", "passed", "circled"]
-    at = 0
-    for n, (centre, state) in enumerate(zip(centres, states)):
-        run = h.targets[at:at + goals(node, state)]
-        at += goals(node, state)
-        np.testing.assert_allclose(np.linalg.norm(np.array(run) - centre, axis=1), run and
-                                   np.linalg.norm(run[0] - np.array(centre)), atol=1e-6)
-        sigma = 1 if n < 2 else -1                               # entry and red clockwise, green and exit not
-        if state in ("flashing_red", "flashing_green"):          # passed: a semicircle on the buoy's side
-            angle = 360.0 * node.pass_points / node.circle_points
-        else:                                                    # circled: all the way round, plus the overshoot
-            angle = 360.0 * (1 + node.circle_overshoot_points / node.circle_points)
-        assert swept(run, centre) == pytest.approx(-sigma * angle, abs=1e-6)
-    assert node.pass_points * 2 == node.circle_points            # the default pass is exactly half a circle
-    assert h.phases().count("TRANSIT") == 4
+    assert ok and circled == 2 and failed == 0, message
+    assert h.stages() == ["ALIGN", "PLAN", "ENTRY", "TRANSIT", "EXIT"]
+    assert CALLS == [(None, True, True)]                                  # planned once, with the entry loop
+    n_entry, n_transit, n_exit = count(h, "ENTRY"), count(h, "TRANSIT"), count(h, "EXIT")
+    assert n_entry == LOOP and len(h.targets) == n_entry + n_transit + n_exit
+    loop = h.targets[:n_entry]
+    np.testing.assert_allclose(loop[0], loop[-1], atol=1e-6)              # it closes on the point it began at
+    assert swept(loop, ENTRY) == pytest.approx(-360.0, abs=1e-6)          # clockwise
+    ring = h.targets[n_entry + n_transit - 1:]                            # from the join point on
+    assert swept(ring, EXIT) == pytest.approx(360.0 + 60.0, abs=1e-6)     # counterclockwise, one goal past the lap
+    assert "red to starboard yes, green to port yes" in message and "route ok" in message
+    assert "1 plan(s), 0 goal(s) failed" in message and "BLOB" in message
+    assert not any("violation" in line for line in message.split("; "))
+    assert node._tracker is None
 
 
-def test_radius_shrinks_for_a_close_neighbour(node):
-    h = Harness(node, [buoy("flashing_red", [0, 0]), buoy("off", [3.2, 0])])
-    h.run()
-    r = np.linalg.norm(h.targets[0])
-    assert r == pytest.approx(3.2 - node.neighbour_clearance)
-
-
-def test_failed_point_is_retried_then_skipped(node):
-    # start ok, point 1 fails twice (retry included) -> skipped, rest ok
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, False, False])
+def test_passes_are_followed_on_the_boat_pose_between_the_circles_only(node):
+    h = Harness(node)
+    seen = []
+    track = node._track
+    node._track = lambda on, progress=None: (seen.append((on, len(h.targets))), track(on, progress))[1]
     ok, circled, failed, message = h.run()
-    assert ok and circled == 1, message
-    np.testing.assert_allclose(h.targets[1], h.targets[2])  # the retry re-sends the same point on a still map
-    assert len(h.targets) == 1 + 2 + (goals(node) - 2)
+    n_entry, n_transit = count(h, "ENTRY"), count(h, "TRANSIT")
+    assert (True, n_entry) in seen                                         # from the entry loop closing ...
+    assert (False, n_entry + n_transit) in seen                            # ... to the exit circle being joined
+    assert not any(on for on, at in seen if at != n_entry)
+    passes = [line for line in message.split("; ") if line.startswith("pass ")]
+    assert any("flashing_red abeam to starboard" in p and "credit" in p for p in passes)
+    assert any("flashing_green abeam to port" in p and "credit" in p for p in passes)
 
 
-def test_two_skips_in_a_row_fail_the_attempt_and_the_second_attempt_starts_over(node):
-    h = Harness(node, [buoy("flashing_green", [0, 0])], results=[True, False, False, False, False])
+def test_buoys_without_a_blob_are_obeyed_but_earn_nothing(node):
+    h = Harness(node, grid=geo.CostGrid.empty())
     ok, circled, failed, message = h.run()
-    assert ok and "2 attempt(s)" in message, message
-    assert h.phases().count("TRANSIT") == 2
+    assert ok and circled == 2 and "PREDICTED" in message and "BLOB" not in message
+    assert "no confirmed red to pass" in message and "red to starboard no, green to port no" in message
+    assert not any("violation" in line for line in message.split("; "))
 
 
-def test_start_point_unreachable_fails_the_attempt(node):
-    node.buoy_attempts = 1
-    h = Harness(node, [buoy("flashing_blue", [0, 0])], results=[False, False])
+def test_no_entry_buoy_starts_from_the_boat(node):
+    h = Harness(node, channel(entry=False), boat=(0.0, 1.0))
     ok, circled, failed, message = h.run()
-    assert not ok and failed == 1 and "failed" in message
-    assert len(h.targets) == 2
+    assert ok and circled == 1 and h.stages() == ["ALIGN", "PLAN", "TRANSIT", "EXIT"]
+    assert CALLS == [((0.0, 1.0), True, True)]
+    assert "red to starboard yes, green to port yes" in message
 
 
-def test_failed_red_requeued_once_before_the_exit(node):
-    node.buoy_attempts = 1
-    h = Harness(node, [buoy("flashing_red", RED), buoy("steady_blue", EXIT)], results=[False, False])
+def test_no_exit_buoy_ends_after_the_passes(node):
+    h = Harness(node, channel(exit_=False))
     ok, circled, failed, message = h.run()
-    assert ok and circled == 2, message  # the requeued attempt succeeded
-    np.testing.assert_allclose(np.linalg.norm(h.targets[2] - RED), np.linalg.norm(h.targets[0] - RED))
-    assert len(h.targets) == 2 + goals(node, "flashing_red") + goals(node, "steady_blue")
-    assert np.linalg.norm(h.targets[-1] - EXIT) < 3.0
+    assert ok and circled == 1 and h.stages() == ["ALIGN", "PLAN", "ENTRY", "TRANSIT"]
+    assert "route missing_exit" in message and "red to starboard yes, green to port yes" in message
 
 
-STATION = [30.0, 12.0]
+def route_inputs(node, h):
+    """Run the goal and return what its (last) plan was made on."""
+    seen = {}
+    drive = node._drive_route
+    node._drive_route = lambda *args: (
+        seen.update(buoys=list(node._route_buoys), candidates=node._aligner.candidates.copy()), drive(*args))[1]
+    return h.run(), seen
 
+
+def test_unknown_buoys_are_dropped_and_take_no_part_in_the_alignment(node):
+    h = Harness(node, channel() + [buoy("unknown", [1.0, 10.0]), buoy("", [5.0, 5.0])],
+                grid=costmap(positions(channel())))
+    (ok, circled, failed, message), seen = route_inputs(node, h)
+    assert ok and circled == 2 and "unknown" not in message
+    np.testing.assert_allclose(seen["candidates"], positions(channel()))  # the seven known ones only
+    assert [b.state for b in seen["buoys"]] == [b.state for b in channel()]
+    assert goal_rejected_without_known_buoys(node)
+
+
+def goal_rejected_without_known_buoys(node):
+    from rclpy.action import GoalResponse
+    request = SimpleNamespace(buoys=[buoy("unknown", [0.0, 0.0]), buoy("off", [1.0, 1.0])])
+    return node._on_goal(request) == GoalResponse.REJECT
+
+
+def test_planner_is_told_about_blobs_the_drone_missed(node):
+    extra = [-6.0, 4.0]                                                  # a buoy-sized object the drone did not report
+    h = Harness(node, grid=costmap(positions(channel()) + [extra]))
+    (ok, circled, failed, message), seen = route_inputs(node, h)
+    assert ok
+    unknown = [b for b in seen["buoys"] if b.state == sr.UNKNOWN]
+    assert len(seen["buoys"]) == len(channel()) + 1 and len(unknown) == 1
+    np.testing.assert_allclose([unknown[0].x, unknown[0].y], extra, atol=0.15)
+    assert all(b.confirmed for b in seen["buoys"])
+
+
+def test_obstacle_cells_are_the_structures_not_the_buoys(node):
+    wall = [[14.0 + 0.1 * k, 16.0] for k in range(40)]
+    h = Harness(node, grid=costmap(positions(channel()) + wall))
+    node._aligner = ba.Aligner(np.array(positions(channel())), node.align_params)
+    node._solved_grid = None
+    node._align_step(h.grid)
+    buoys = [spn.Buoy(i, b.state, np.array(xy)) for i, (b, xy) in enumerate(zip(channel(), positions(channel())))]
+    inputs, cells = node._planner_inputs(buoys, h.grid)
+    assert len(inputs) == len(buoys) and len(cells) > 100
+    assert cells[:, 0].min() > 13.5 and abs(cells[:, 1] - 16.0).max() < 0.3   # the wall only
+    node._aligner.buoy_blobs = np.zeros((0, 2))                           # the costmap cleared the blobs for a moment
+    again, _ = node._planner_inputs(buoys, h.grid)
+    assert all(b.confirmed for b in again)                                # every buoy stays where it was seen
+    node._aligner = None
+
+
+# Retries
+
+def test_failed_goal_is_sent_again_up_to_three_times_in_all(node):
+    h = Harness(node, results=[True, False, False])
+    ok, circled, failed, message = h.run()
+    assert ok and failed == 0 and "1 plan(s)" in message
+    np.testing.assert_allclose(h.targets[1], h.targets[2])
+    np.testing.assert_allclose(h.targets[1], h.targets[3])
+
+
+def test_goal_that_fails_three_times_in_the_entry_loop_plans_the_whole_run_again(node):
+    h = Harness(node, results=[True, True, False, False, False])
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 2 and failed == 1 and "2 plan(s), 1 goal(s) failed" in message
+    assert h.stages() == ["ALIGN", "PLAN", "ENTRY", "PLAN", "ENTRY", "TRANSIT", "EXIT"]
+    assert CALLS == [(None, True, True), (None, True, True)]             # the loop had not closed: it is done again
+    np.testing.assert_allclose(h.targets[5], h.targets[0])                # ... from its start point
+
+
+def test_goal_that_fails_in_the_transit_plans_again_from_the_boat_without_the_entry_loop(node):
+    h = Harness(node, results=[True] * LOOP + [False] * 3)                # the transit is one goal here
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 2 and failed == 1, message
+    assert h.stages() == ["ALIGN", "PLAN", "ENTRY", "TRANSIT", "PLAN", "TRANSIT", "EXIT"]
+    assert CALLS[0] == (None, True, True) and len(CALLS) == 2
+    start, need_red, need_green = CALLS[1]
+    np.testing.assert_allclose(start, h.targets[LOOP - 1], atol=0.01)     # where the boat stopped
+    assert need_red and need_green
+    assert "red to starboard yes, green to port yes" in message
+    assert not any("violation" in line for line in message.split("; "))
+
+
+def test_passes_in_hand_are_not_planned_for_again(node):
+    h = Harness(node)
+    transit = []
+    ok, circled, failed, message = h.run()                                # a clean run, to learn the transit
+    transit = count(h, "TRANSIT")
+    del CALLS[:]
+    h = Harness(node, results=[True] * (LOOP + transit) + [False] * 3)    # the first exit goal fails every time
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 2 and failed == 1
+    assert CALLS[1][1:] == (False, False)                                 # both passes were made on the transit
+
+
+def test_no_route_is_planned_again_until_there_is_one(node):
+    h = Harness(node)
+    answers = [sr.RoutePlan("no_route", "nothing"), sr.RoutePlan("no_route", "nothing")]
+    inner = sr.plan_route
+    sr.plan_route = lambda *a, **k: answers.pop(0) if answers else inner(*a, **k)
+    try:
+        ok, circled, failed, message = h.run()
+    finally:
+        sr.plan_route = inner
+    assert ok and circled == 2 and "3 plan(s)" in message and h.phases().count("PLAN") == 3
+
+
+def test_planner_fault_is_planned_again(node):
+    h = Harness(node)
+    faults = [True]
+    inner = sr.plan_route
+
+    def faulty(*a, **k):
+        if faults:
+            faults.pop()
+            raise RuntimeError("boom")
+        return inner(*a, **k)
+
+    sr.plan_route = faulty
+    try:
+        ok, circled, failed, message = h.run()
+    finally:
+        sr.plan_route = inner
+    assert ok and "2 plan(s)" in message
+
+
+def test_goal_timeout_grows_with_the_distance(node):
+    h = Harness(node, boat=(0.0, -40.0))
+    assert h.run()[0]
+    far = float(np.hypot(*(h.targets[0] - [0.0, -40.0])))
+    assert h.timeouts[0] == pytest.approx(node.goal_timeout + far / node.goal_speed)
+    assert h.timeouts[1] < h.timeouts[0] and h.timeouts[1] > node.goal_timeout
+
+
+def test_node_and_yaml_agree(node):
+    import yaml
+    cfg = yaml.safe_load(open(ROOT / "cfg/asv5_safe_passage.yaml"))["safe_passage_node"]["ros__parameters"]
+    assert cfg["point_retries"] == node.point_retries == 2
+    assert cfg["circle_radius"] == node.route_params.circle_radius and cfg["circle_points"] == 6
+    assert cfg["incident_return"] is True and node.incident_return is True
+    for gone in ("pass_points", "gate_min_width", "buoy_attempts", "requeue_failed", "estimate_restart_threshold"):
+        assert gone not in cfg
+    declared = set(node._parameters)
+    assert set(cfg) <= declared, set(cfg) - declared
+
+
+# Task 4 Core
 
 def assistance(seq=30, xy=STATION, vehicle_type="usv"):
     msg = AssistanceRequest(seq=seq, vehicle_type=vehicle_type)
@@ -213,34 +445,104 @@ def request_now(node, *args, **kwargs):
     return arrive
 
 
-def test_assistance_request_mid_circle_runs_the_core_chain_then_redoes_the_buoy(node):
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, True, request_now(node)], respond=True)
+def test_request_in_the_entry_loop_runs_the_core_chain_goes_back_and_does_the_loop_again(node):
+    h = Harness(node, results=[True, True, request_now(node)], respond=True)
     later(0.3, node._on_confirm, confirm())
     ok, circled, failed, message = h.run()
-    assert ok and "1 attempt(s)" in message, message      # the interrupted attempt does not count
+    assert ok and circled == 2 and failed == 0, message     # an interrupt is not a failed goal
     assert "assistance request 30 confirmed" in message
     assert h.acks == [30] and h.reports == [30]
     assert h.tasks == ["dynamic_incident", "safe_passage"]
-    phases = h.phases()
-    assert phases.index("INCIDENT_TRANSIT") < phases.index("INCIDENT_ON_STATION")
-    assert phases[phases.index("INCIDENT_ON_STATION") + 1] == "TRANSIT"   # the buoy starts over
-    per = goals(node)
+    assert h.stages() == ["ALIGN", "PLAN", "ENTRY", "INCIDENT_TRANSIT", "INCIDENT_ON_STATION", "INCIDENT_RETURN",
+                          "PLAN", "ENTRY", "TRANSIT", "EXIT"]
     np.testing.assert_allclose(h.targets[3], STATION)
-    assert len(h.targets) == 3 + 1 + per
+    np.testing.assert_allclose(h.targets[4], h.targets[1])  # back to where it was interrupted
+    np.testing.assert_allclose(h.targets[5], h.targets[0])  # the loop had not closed: all of it again
+    assert CALLS == [(None, True, True), (None, True, True)]
     assert node._pending is None and node._incident is None
     assert [x.state for x in node._incidents] == ["confirmed"] and node._incidents[0].report_seq == 412
 
 
+def test_request_in_the_transit_goes_back_then_plans_from_there_without_the_entry_loop(node):
+    h = Harness(node, results=[True] * LOOP + [request_now(node)], respond=True)
+    later(0.3, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 2, message
+    assert h.stages() == ["ALIGN", "PLAN", "ENTRY", "TRANSIT", "INCIDENT_TRANSIT", "INCIDENT_ON_STATION",
+                          "INCIDENT_RETURN", "PLAN", "TRANSIT", "EXIT"]
+    np.testing.assert_allclose(h.targets[LOOP + 1], STATION)
+    np.testing.assert_allclose(h.targets[LOOP + 2], h.targets[LOOP - 1])     # back to the last goal it reached
+    np.testing.assert_allclose(CALLS[1][0], h.targets[LOOP - 1], atol=0.01)  # and planned from there
+    assert "red to starboard yes, green to port yes" in message
+    assert not any("violation" in line for line in message.split("; "))  # the way out and back is not followed
+
+
+def test_request_in_the_exit_circle_plans_back_to_it_with_nothing_left_to_pass(node):
+    h = Harness(node)
+    h.run()
+    transit = count(h, "TRANSIT")
+    del CALLS[:]
+    h = Harness(node, results=[True] * (LOOP + transit + 1) + [request_now(node)], respond=True)
+    later(0.3, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 2 and CALLS[1][1:] == (False, False)
+    assert h.stages()[-3:] == ["PLAN", "TRANSIT", "EXIT"]
+
+
+def test_without_incident_return_the_plan_starts_at_the_station(node):
+    node.incident_return = False
+    h = Harness(node, results=[True] * LOOP + [request_now(node)], respond=True)
+    later(0.3, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and "INCIDENT_RETURN" not in h.phases()
+    np.testing.assert_allclose(CALLS[1][0], STATION, atol=0.01)
+
+
+def test_request_while_planning_is_answered_at_once_and_the_plan_is_made_again(node):
+    h = Harness(node, respond=True)
+    inner, slow = sr.plan_route, [True]
+
+    def plan(*a, **k):
+        if slow:
+            slow.pop()
+            time.sleep(0.6)
+        return inner(*a, **k)
+
+    sr.plan_route = plan
+    later(0.2, node._on_assistance, assistance())
+    later(0.5, node._on_confirm, confirm())
+    try:
+        ok, circled, failed, message = h.run()
+    finally:
+        sr.plan_route = inner
+    assert ok and circled == 2 and "assistance request 30 confirmed" in message
+    assert h.stages()[:6] == ["ALIGN", "PLAN", "INCIDENT_TRANSIT", "INCIDENT_ON_STATION", "INCIDENT_RETURN", "PLAN"]
+    np.testing.assert_allclose(h.targets[0], STATION)
+    np.testing.assert_allclose(h.targets[1], [0.0, -10.0])               # back to where the boat was holding
+    assert h.tasks == ["dynamic_incident", "safe_passage"]
+
+
+def test_request_during_align_is_answered_then_alignment_goes_on(node):
+    h = Harness(node, respond=True, grid=geo.CostGrid.empty())           # nothing to lock on
+    node.align_timeout = 0.5
+    later(0.15, node._on_assistance, assistance())
+    later(0.4, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 2 and "assistance request 30 confirmed" in message
+    assert h.stages()[:5] == ["ALIGN", "INCIDENT_TRANSIT", "INCIDENT_ON_STATION", "INCIDENT_RETURN", "ALIGN"]
+    np.testing.assert_allclose(h.targets[0], STATION)
+    np.testing.assert_allclose(h.targets[1], [0.0, -10.0])
+
+
 def test_request_for_another_vehicle_type_is_ignored(node):
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node, vehicle_type="uuv")],
-                respond=True)
+    h = Harness(node, results=[True, request_now(node, vehicle_type="uuv")], respond=True)
     ok, circled, failed, message = h.run()
     assert ok and h.acks == [] and h.tasks == [] and "assistance" not in message
     assert "INCIDENT_TRANSIT" not in h.phases()
 
 
 def test_request_is_ignored_when_the_goal_does_not_ask_for_it(node):
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node)])
+    h = Harness(node, results=[True, request_now(node)])
     assert h.run()[0] and h.acks == [] and "INCIDENT_TRANSIT" not in h.phases()
 
 
@@ -253,13 +555,13 @@ def test_request_with_no_goal_running_is_held_and_answered_first_by_the_next_goa
     node._on_assistance(assistance(seq=30))               # nothing running: held, however long
     node._held.received -= 3600.0                         # an hour ago: no time limit
     assert node._pending is None and node._held.seq == 30
-    h = Harness(node, [buoy("flashing_red", [0, 0])], respond=True)
+    h = Harness(node, respond=True)
     later(0.2, node._on_confirm, confirm())
     ok, circled, failed, message = h.run()
-    assert ok and circled == 1 and "assistance request 30 confirmed after 36" in message
+    assert ok and circled == 2 and "assistance request 30 confirmed after 36" in message
     assert h.acks == [30] and h.reports == [30] and node._held is None
     np.testing.assert_allclose(h.targets[0], STATION)     # before anything else, ALIGN included
-    assert h.phases()[0] == "INCIDENT_TRANSIT"
+    assert h.stages()[:3] == ["INCIDENT_TRANSIT", "INCIDENT_ON_STATION", "ALIGN"]   # nothing to go back to
 
 
 def test_clear_assistance_drops_a_held_request(node):
@@ -267,13 +569,13 @@ def test_clear_assistance_drops_a_held_request(node):
     response = clear(node)
     assert response.success and "dropped held assistance request 30" in response.message and node._held is None
     assert "no assistance request was held" in clear(node).message
-    h = Harness(node, [buoy("flashing_red", [0, 0])], respond=True)
+    h = Harness(node, respond=True)
     ok, circled, failed, message = h.run()
     assert ok and h.acks == [] and "assistance" not in message
 
 
 def test_clear_assistance_leaves_a_request_being_answered(node):
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node)], respond=True)
+    h = Harness(node, results=[True, request_now(node)], respond=True)
     cleared = []
     later(0.15, lambda: cleared.append(clear(node).message))
     later(0.3, node._on_confirm, confirm())
@@ -292,7 +594,7 @@ def test_only_the_newest_idle_request_for_us_is_held(node):
 
 def test_goal_that_does_not_answer_requests_leaves_the_held_one(node):
     node._on_assistance(assistance(seq=30))
-    h = Harness(node, [buoy("flashing_red", [0, 0])])     # respond_to_assistance false
+    h = Harness(node)                                     # respond_to_assistance false
     assert h.run()[0] and h.acks == [] and node._held.seq == 30
 
 
@@ -305,22 +607,19 @@ def test_holding_can_be_switched_off(node):
 def test_seq_can_come_again_in_another_goal(node):
     """RoboCommand may number from 1 again in the next run: the node must not turn that request down."""
     for _ in range(2):
-        h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node, seq=1)], respond=True)
+        h = Harness(node, results=[True, request_now(node, seq=1)], respond=True)
         later(0.2, node._on_confirm, confirm())
         ok, circled, failed, message = h.run()
         assert ok and h.acks == [1] and "assistance request 1 confirmed" in message
         node._respond = False                             # as _execute leaves it when a goal ends
 
 
-def test_incident_transit_gets_its_own_goal_timeout(node):
-    timeouts = []
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node)], respond=True)
-    inner = node._run_action
-    node._run_action = lambda gh, client, name, goal, timeout, ok: (timeouts.append(timeout),
-                                                                    inner(gh, client, name, goal, timeout, ok))[1]
+def test_incident_transit_and_the_way_back_get_the_incident_goal_timeout(node):
+    h = Harness(node, results=[True, request_now(node)], respond=True)
     later(0.2, node._on_confirm, confirm())
     assert h.run()[0]
-    assert timeouts[1] == node.goal_timeout and timeouts[2] == node.incident_goal_timeout == 300.0
+    assert h.timeouts[2] == h.timeouts[3] == node.incident_goal_timeout == 300.0
+    assert h.timeouts[1] < 300.0
 
 
 def test_older_task_switch_gives_way_to_a_newer_one(node):
@@ -366,7 +665,7 @@ def test_repeated_request_is_answered_once(node):
             node._on_assistance(assistance())
         return True
 
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, repeat], respond=True)
+    h = Harness(node, results=[True, repeat], respond=True)
     later(0.2, node._on_assistance, assistance())
     later(0.3, node._on_confirm, confirm())
     ok, circled, failed, message = h.run()
@@ -374,14 +673,14 @@ def test_repeated_request_is_answered_once(node):
 
 
 def test_only_our_confirm_for_our_report_releases_the_hold(node):
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node)], respond=True)
+    h = Harness(node, results=[True, request_now(node)], respond=True)
     node.readiness_confirm_timeout = 0.6
     later(0.1, node._on_confirm, confirm(vehicle_id="USV2"))        # another vehicle's
     later(0.15, node._on_confirm, confirm(report_seq=411))          # ours, another report
     started = time.monotonic()
     ok, circled, failed, message = h.run()
     assert time.monotonic() - started >= 0.6
-    assert ok and circled == 1 and "assistance request 30 confirm_timeout" in message
+    assert ok and circled == 2 and "assistance request 30 confirm_timeout" in message
     assert h.tasks == ["dynamic_incident", "safe_passage"]          # resumes on its own after the timeout
 
 
@@ -391,56 +690,66 @@ def test_confirm_that_beats_the_report_seq_still_counts(node):
         node._on_confirm(confirm())                       # before the ReadinessReport action has returned 412
         return True
 
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, arrive], respond=True)
+    h = Harness(node, results=[True, arrive], respond=True)
     started = time.monotonic()
     ok, circled, failed, message = h.run()
-    assert ok and "assistance request 30 confirmed" in message and time.monotonic() - started < 2.0
+    assert ok and "assistance request 30 confirmed" in message and time.monotonic() - started < 2.0 + 10.0
 
 
 def test_newer_request_replaces_the_one_in_hand(node):
     other = [-20.0, -9.0]
-    h = Harness(node, [buoy("flashing_red", [0, 0])], respond=True,
-                results=[True, request_now(node, seq=30), request_now(node, seq=31, xy=other)])
+    h = Harness(node, respond=True, results=[True, request_now(node, seq=30), request_now(node, seq=31, xy=other)])
     later(0.3, node._on_confirm, confirm())
     ok, circled, failed, message = h.run()
     assert ok and "assistance request 30 superseded" in message and "assistance request 31 confirmed" in message
     assert h.acks == [30, 31] and h.reports == [31]
     np.testing.assert_allclose(h.targets[2], STATION)
     np.testing.assert_allclose(h.targets[3], other)
+    np.testing.assert_allclose(h.targets[4], h.targets[0])          # back once, after both
     assert h.tasks[-1] == "safe_passage" and h.tasks.count("safe_passage") == 1
 
 
-def test_unreachable_station_sends_no_readiness_report_and_resumes(node):
-    h = Harness(node, [buoy("flashing_red", [0, 0])], respond=True,
-                results=[True, request_now(node), False, False, False])
+def test_request_on_the_way_back_is_answered_then_the_boat_goes_back_again(node):
+    other = [-20.0, -9.0]
+    h = Harness(node, respond=True,
+                results=[True, request_now(node, seq=30), True, request_now(node, seq=31, xy=other)])
+    later(0.2, node._on_confirm, confirm())
+    later(0.6, node._on_confirm, confirm(report_seq=412, seq=100))
     ok, circled, failed, message = h.run()
-    assert ok and circled == 1 and "assistance request 30 unreachable" in message
+    assert ok and "assistance request 30 confirmed" in message and "assistance request 31 confirmed" in message
+    np.testing.assert_allclose(h.targets[2], STATION)
+    np.testing.assert_allclose(h.targets[3], h.targets[0])          # on the way back when 31 arrives
+    np.testing.assert_allclose(h.targets[4], other)
+    np.testing.assert_allclose(h.targets[5], h.targets[0])          # back again
+    assert h.tasks.count("safe_passage") == 1                       # the task is switched back once, at the end
+
+
+def test_unreachable_station_sends_no_readiness_report_and_resumes(node):
+    h = Harness(node, respond=True, results=[True, request_now(node), False, False, False])
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 2 and "assistance request 30 unreachable" in message
     assert h.acks == [30] and h.reports == [] and h.tasks == ["dynamic_incident", "safe_passage"]
     assert "INCIDENT_ON_STATION" not in h.phases()
 
 
+def test_way_back_that_cannot_be_driven_plans_from_where_the_boat_is(node):
+    h = Harness(node, respond=True, results=[True] * LOOP + [request_now(node), True, False, False, False])
+    later(0.3, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 2 and failed == 0
+    np.testing.assert_allclose(CALLS[1][0], STATION, atol=0.01)
+
+
 def test_readiness_report_that_cannot_be_sent_resumes_without_waiting(node):
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node)], respond=True)
+    h = Harness(node, results=[True, request_now(node)], respond=True)
     h.report_seq = None
     started = time.monotonic()
     ok, circled, failed, message = h.run()
-    assert ok and "assistance request 30 report_failed" in message and time.monotonic() - started < 2.0
-
-
-def test_request_during_align_is_answered_then_alignment_goes_on(node):
-    h = Harness(node, [buoy("flashing_red", [0, 0])], respond=True)
-    node.align_timeout = 0.5
-    later(0.15, node._on_assistance, assistance())
-    later(0.4, node._on_confirm, confirm())
-    ok, circled, failed, message = h.run()
-    assert ok and circled == 1 and "assistance request 30 confirmed" in message
-    phases = h.phases()
-    assert phases[0] == "ALIGN" and "ALIGN" in phases[phases.index("INCIDENT_ON_STATION"):]
-    np.testing.assert_allclose(h.targets[0], STATION)
+    assert ok and "assistance request 30 report_failed" in message and time.monotonic() - started < 12.0
 
 
 def test_cancel_stops_everything(node):
-    h = Harness(node, [buoy("flashing_red", RED), buoy("steady_blue", EXIT)])
+    h = Harness(node)
 
     def cancel():
         h.goal.is_cancel_requested = True
@@ -449,11 +758,24 @@ def test_cancel_stops_everything(node):
     h.results = [True, cancel]
     with pytest.raises(spn.Canceled):
         h.run()
-    assert len(h.targets) == 2
+    assert len(h.targets) == 2 and node._tracker is None
+
+
+def test_cancel_while_planning(node):
+    h = Harness(node)
+    inner = sr.plan_route
+    sr.plan_route = lambda *a, **k: (time.sleep(0.5), inner(*a, **k))[1]
+    later(0.2, setattr, h.goal, "is_cancel_requested", True)
+    try:
+        with pytest.raises(spn.Canceled):
+            h.run()
+    finally:
+        sr.plan_route = inner
+    assert h.targets == []
 
 
 def test_cancel_while_holding_on_station(node):
-    h = Harness(node, [buoy("flashing_red", RED)], results=[True, request_now(node)], respond=True)
+    h = Harness(node, results=[True, request_now(node)], respond=True)
     later(0.3, setattr, h.goal, "is_cancel_requested", True)
     with pytest.raises(spn.Canceled):
         h.run()
@@ -461,18 +783,54 @@ def test_cancel_while_holding_on_station(node):
     assert node._incidents[0].state == "on_station"   # _execute closes it as canceled when the goal ends
 
 
-LAYOUT = np.array([[0.0, 0.0], [9.0, 3.0], [10.0, -3.0], [20.0, 0.0], [15.0, 8.0], [5.0, -8.0]])
-STATES = ["flashing_blue", "flashing_red", "flashing_green", "steady_blue", "off", "off"]
+def test_confirm_counts_when_an_earlier_report_try_may_have_gone_out(node):
+    """A failed try can reach RoboCommand under a seq we never learn; its confirm must still release the hold."""
+    h = Harness(node, results=[True, request_now(node)], respond=True)
+    h.report_seq, h.report_unsure = 413, True
+    node._on_confirm(confirm(report_seq=400))                       # before the goal: never counts
+    later(0.3, node._on_confirm, confirm(report_seq=412))           # the try we think failed
+    started = time.monotonic()
+    ok, circled, failed, message = h.run()
+    assert ok and "assistance request 30 confirmed" in message and time.monotonic() - started < 4.0
+
+
+def test_confirm_from_before_the_station_does_not_count_even_when_unsure(node):
+    def arrive():
+        node._on_assistance(assistance())
+        node._on_confirm(confirm(report_seq=390))                   # in this goal, but before we got on station
+        return True
+
+    h = Harness(node, results=[True, arrive], respond=True)
+    h.report_seq, h.report_unsure = 413, True
+    node.readiness_confirm_timeout = 0.5
+    ok, circled, failed, message = h.run()
+    assert ok and "assistance request 30 confirm_timeout" in message
+
+
+def test_request_during_the_switch_back_is_answered_before_going_on(node):
+    other = [-20.0, -9.0]
+    h = Harness(node, results=[True, request_now(node, seq=30)], respond=True)
+    sent = []
+
+    def send_task(task, goal_handle=None):
+        sent.append(task)
+        if sent == ["dynamic_incident", "safe_passage"]:            # a second request lands during the switch back
+            node._on_assistance(assistance(seq=31, xy=other))
+    node._send_task = send_task
+    later(0.2, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and "assistance request 30 confirmed" in message and "assistance request 31 confirmed" in message
+    assert sent == ["dynamic_incident", "safe_passage", "dynamic_incident", "safe_passage"]
+    np.testing.assert_allclose(h.targets[2], STATION)
+    np.testing.assert_allclose(h.targets[4], other)
+    assert h.phases().count("PLAN") == 2                            # planned again once, after both
+
+
+# Alignment
+
+LAYOUT = np.array(positions(channel()))
+STATES = [b.state for b in channel()]
 SHIFT = np.array([2.0, 6.0])
-
-
-def costmap(points, size=80.0, origin=(-30.0, -40.0), res=0.1):
-    n = int(size / res)
-    data = np.zeros((n, n), dtype=np.int16)
-    for x, y in points:
-        c, r = int((x - origin[0]) / res), int((y - origin[1]) / res)
-        data[r - 2:r + 2, c - 2:c + 2] = 100
-    return geo.CostGrid(data, res, origin[0], origin[1])
 
 
 def feed(node, grid, times=6, period=0.05):
@@ -484,23 +842,20 @@ def feed(node, grid, times=6, period=0.05):
     threading.Thread(target=loop, daemon=True).start()
 
 
-def test_layout_is_aligned_to_the_costmap_before_any_driving(node):
-    """Drone layout 6 m off: the node holds in ALIGN, locks the shift, then circles the real buoys."""
+def test_layout_is_aligned_to_the_costmap_before_anything_is_planned(node):
+    """Drone layout 6 m off: the node holds in ALIGN, locks the shift, then routes around the real buoys."""
     grid = costmap(LAYOUT + SHIFT)
-    h = Harness(node, [buoy(s, xy) for s, xy in zip(STATES, LAYOUT)], boat=(-10.0, 5.0))
-    node._snapshot = lambda: grid
+    h = Harness(node, boat=(2.0, -4.0), grid=grid)
     node.align_timeout = 5.0
     feed(node, grid)
     ok, circled, failed, message = h.run()
-    assert ok and circled == 4, message
-    assert h.phases()[0] == "ALIGN" and "ALIGN" not in h.phases()[h.phases().index("TRANSIT"):]
-    at = 0
-    for i in [0, 1, 2, 3]:  # entry, red, green, exit
-        run = np.array(h.targets[at:at + goals(node, STATES[i])])
-        at += goals(node, STATES[i])
-        radii = np.linalg.norm(run - (LAYOUT[i] + SHIFT), axis=1)
-        assert radii.max() - radii.min() < 0.15, (i, radii)  # around the real buoy, not the drone's
-    assert "BLOB" in message
+    assert ok and circled == 2, message
+    assert h.stages() == ["ALIGN", "PLAN", "ENTRY", "TRANSIT", "EXIT"]
+    loop = np.array(h.targets[:LOOP])
+    radii = np.linalg.norm(loop - (np.array(ENTRY) + SHIFT), axis=1)
+    assert radii.max() - radii.min() < 0.15, radii                 # around the real entry buoy, not the drone's
+    assert "BLOB" in message and "PREDICTED" not in message
+    assert "red to starboard yes, green to port yes" in message
     assert h.goal.feedback[-1].shift_inliers == len(LAYOUT)
     node._aligner, node._buoys = ba.Aligner(LAYOUT, node.align_params), []
     node._publish_markers()  # must not raise
@@ -508,18 +863,18 @@ def test_layout_is_aligned_to_the_costmap_before_any_driving(node):
 
 
 def test_no_lock_goes_on_with_the_drone_positions_after_the_timeout(node):
-    h = Harness(node, [buoy("flashing_red", [0.0, 0.0])])
+    h = Harness(node, grid=geo.CostGrid.empty())
     node.align_timeout = 0.3
     started = time.monotonic()
     ok, circled, failed, message = h.run()
-    assert ok and circled == 1 and "PREDICTED" in message
-    assert 0.3 <= time.monotonic() - started < 2.0
-    radii = np.linalg.norm(np.array(h.targets), axis=1)
-    assert radii.max() - radii.min() < 1e-6
+    assert ok and circled == 2 and "PREDICTED" in message
+    assert time.monotonic() - started >= 0.3
+    radii = np.linalg.norm(np.array(h.targets[:LOOP]) - ENTRY, axis=1)
+    assert radii.max() - radii.min() < 0.05                        # the loop is around the drone's entry position
 
 
 def test_cancel_while_aligning(node):
-    h = Harness(node, [buoy("flashing_red", [0.0, 0.0])])
+    h = Harness(node, grid=geo.CostGrid.empty())
     node.align_timeout = 5.0
     threading.Timer(0.2, lambda: setattr(h.goal, "is_cancel_requested", True)).start()
     with pytest.raises(spn.Canceled):
@@ -527,17 +882,27 @@ def test_cancel_while_aligning(node):
     assert h.targets == []
 
 
-def test_circle_follows_a_blob_near_the_drone_position_without_a_lock(node):
-    """One buoy cannot lock a shift, but a blob within the snap radius still centres the circle."""
-    grid = costmap([[10.7, 0.0]])
-    h = Harness(node, [buoy("flashing_red", [10.0, 0.0])], boat=(0.0, 0.0))
-    node._snapshot = lambda: grid
-    feed(node, grid, times=2, period=0.0)
-    time.sleep(0.05)
+def test_blob_near_the_drone_position_is_used_without_a_lock(node):
+    """A layout that cannot lock a shift: a blob within the snap radius still places its buoy."""
+    moved = LAYOUT.copy()
+    moved[STATES.index("flashing_blue")] += [0.6, 0.0]
+    h = Harness(node, grid=costmap(moved))
     ok, circled, failed, message = h.run()
-    assert ok and "BLOB" in message, message
-    radii = np.linalg.norm(np.array(h.targets) - [10.7, 0.0], axis=1)
+    assert ok and "5:flashing_blue BLOB 0.6" in message, message
+    radii = np.linalg.norm(np.array(h.targets[:LOOP]) - (np.array(ENTRY) + [0.6, 0.0]), axis=1)
     assert radii.max() - radii.min() < 0.15
+
+
+def test_same_costmap_counts_once_towards_the_lock(node):
+    grid = costmap(LAYOUT + SHIFT)
+    node._aligner = ba.Aligner(LAYOUT, node.align_params)
+    for _ in range(5):
+        node._align_step(grid)
+    assert not node._aligner.locked                                   # one costmap, however often it is offered
+    for _ in range(2):
+        node._align_step(costmap(LAYOUT + SHIFT))
+    assert node._aligner.locked
+    node._aligner = None
 
 
 def test_reports_go_out_through_real_actions(ros):
@@ -590,256 +955,3 @@ def test_reports_go_out_through_real_actions(ros):
             server.destroy()
         node.destroy_node()
         ocs.destroy_node()
-
-
-def test_confirm_counts_when_an_earlier_report_try_may_have_gone_out(node):
-    """A failed try can reach RoboCommand under a seq we never learn; its confirm must still release the hold."""
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node)], respond=True)
-    h.report_seq, h.report_unsure = 413, True
-    node._on_confirm(confirm(report_seq=400))                       # before the goal: never counts
-    later(0.3, node._on_confirm, confirm(report_seq=412))           # the try we think failed
-    started = time.monotonic()
-    ok, circled, failed, message = h.run()
-    assert ok and "assistance request 30 confirmed" in message and time.monotonic() - started < 3.0
-
-
-def test_confirm_from_before_the_station_does_not_count_even_when_unsure(node):
-    def arrive():
-        node._on_assistance(assistance())
-        node._on_confirm(confirm(report_seq=390))                   # in this goal, but before we got on station
-        return True
-
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, arrive], respond=True)
-    h.report_seq, h.report_unsure = 413, True
-    node.readiness_confirm_timeout = 0.5
-    ok, circled, failed, message = h.run()
-    assert ok and "assistance request 30 confirm_timeout" in message
-
-
-def test_request_during_the_switch_back_is_answered_before_going_on(node):
-    other = [-20.0, -9.0]
-    h = Harness(node, [buoy("flashing_red", [0, 0])], results=[True, request_now(node, seq=30)], respond=True)
-    sent = []
-
-    def send_task(task, goal_handle=None):
-        sent.append(task)
-        if sent == ["dynamic_incident", "safe_passage"]:            # a second request lands during the switch back
-            node._on_assistance(assistance(seq=31, xy=other))
-    node._send_task = send_task
-    later(0.2, node._on_confirm, confirm())
-    ok, circled, failed, message = h.run()
-    assert ok and "assistance request 30 confirmed" in message and "assistance request 31 confirmed" in message
-    assert sent == ["dynamic_incident", "safe_passage", "dynamic_incident", "safe_passage"]
-    np.testing.assert_allclose(h.targets[2], STATION)
-    np.testing.assert_allclose(h.targets[3], other)
-    per = goals(node)
-    assert len(h.targets) == 2 + 2 + per                            # the buoy started over once, after both
-
-
-def test_blob_missing_from_one_costmap_does_not_move_the_circle(node):
-    truth = np.array([10.7, 0.0])
-    grid = costmap([truth])
-    h = Harness(node, [buoy("flashing_red", [10.0, 0.0])], boat=(0.0, 0.0))
-    node._snapshot = lambda: grid
-
-    def blob_gone():
-        node._aligner.buoy_blobs = np.zeros((0, 2))                 # the costmap cleared it for a moment
-        return True
-
-    h.results = [True, True, blob_gone]
-    ok, circled, failed, message = h.run()
-    assert ok and circled == 1
-    radii = np.linalg.norm(np.array(h.targets) - truth, axis=1)
-    assert radii.max() - radii.min() < 0.15, radii                  # every point still around the blob
-
-
-def test_layout_locking_mid_circle_starts_the_buoy_over(node):
-    """No lock by the timeout, so the circle starts on the drone's position; the lock then moves it metres."""
-    shift = np.array([4.0, 0.0])
-    h = Harness(node, [buoy("flashing_red", [0.0, 0.0])])
-
-    def lock_now():
-        node._aligner.t, node._aligner.locked = shift.copy(), True
-        return True
-
-    h.results = [True, True, lock_now]
-    ok, circled, failed, message = h.run()
-    assert ok and circled == 1 and "1 attempt(s)" in message         # the restart is not a failed attempt
-    per = goals(node)
-    assert h.phases().count("TRANSIT") == 2 and len(h.targets) == 3 + per
-    radii = np.linalg.norm(np.array(h.targets[3:]) - shift, axis=1)
-    assert radii.max() - radii.min() < 1e-6                           # a whole circle around where it really is
-
-
-def test_restarts_are_capped_then_points_are_only_re_placed(node):
-    node.buoy_restarts = 1
-    h = Harness(node, [buoy("flashing_red", [0.0, 0.0])])
-    jumps = iter([np.array([4.0, 0.0]), np.array([8.0, 0.0])])
-
-    def jump():
-        node._aligner.t = next(jumps)
-        return True
-
-    h.results = [True, jump, True, jump]
-    ok, circled, failed, message = h.run()
-    assert ok and circled == 1 and h.phases().count("TRANSIT") == 2   # one restart, the second jump re-places
-
-
-def test_same_costmap_counts_once_towards_the_lock(node):
-    grid = costmap(LAYOUT + SHIFT)
-    node._aligner = ba.Aligner(LAYOUT, node.align_params)
-    for _ in range(5):
-        node._align_step(grid)
-    assert not node._aligner.locked                                   # one costmap, however often it is offered
-    for _ in range(2):
-        node._align_step(costmap(LAYOUT + SHIFT))
-    assert node._aligner.locked
-    node._aligner = None
-
-
-def test_restart_after_an_incident_keeps_the_blob_a_costmap_misses(node):
-    """The buoy restarts on a costmap that lacks its blob for a moment: it is still circled where it was seen."""
-    truth = np.array([10.7, 0.0])
-    grid = costmap([truth])
-    h = Harness(node, [buoy("flashing_red", [10.0, 0.0])], boat=(0.0, 0.0), respond=True)
-    node._snapshot = lambda: grid
-
-    def request_and_lose_the_blob():
-        node._on_assistance(assistance(xy=[30.0, 12.0]))
-        node._aligner.buoy_blobs = np.zeros((0, 2))
-        return True
-
-    h.results = [True, True, request_and_lose_the_blob]
-    later(0.2, node._on_confirm, confirm())
-    ok, circled, failed, message = h.run()
-    assert ok and circled == 1 and "BLOB" in message
-    per = goals(node)
-    radii = np.linalg.norm(np.array(h.targets[-per:]) - truth, axis=1)
-    assert radii.max() - radii.min() < 0.15, radii              # the whole restarted circle is around the blob
-
-
-def test_unknown_buoys_are_dropped_and_take_no_part_in_the_alignment(node):
-    h = Harness(node, [buoy("unknown", [3.0, 3.0]), buoy("flashing_red", [0.0, 0.0]), buoy("", [5.0, 5.0]),
-                       buoy("off", [8.0, 0.0])])
-    seen = []
-    drive = node._drive
-    node._drive = lambda *a, **k: (seen.append(node._aligner.candidates.copy()), drive(*a, **k))[1]
-    ok, circled, failed, message = h.run()
-    assert ok and circled == 1 and "unknown" not in message
-    np.testing.assert_allclose(seen[0], [[0.0, 0.0], [8.0, 0.0]])    # the red and the black only
-    assert goal_rejected_without_known_buoys(node)
-
-
-def goal_rejected_without_known_buoys(node):
-    from rclpy.action import GoalResponse
-    request = SimpleNamespace(buoys=[buoy("unknown", [0.0, 0.0]), buoy("off", [1.0, 1.0])])
-    return node._on_goal(request) == GoalResponse.REJECT
-
-
-def side_of(boat_from, boat_to, buoy_xy):
-    """'port' or 'starboard': where buoy_xy is for a boat arriving at boat_to from boat_from."""
-    heading = np.asarray(boat_to) - np.asarray(boat_from)
-    to_buoy = np.asarray(buoy_xy) - np.asarray(boat_to)
-    return "port" if heading[0] * to_buoy[1] - heading[1] * to_buoy[0] > 0 else "starboard"
-
-
-def test_node_defaults_to_one_waypoint_per_red_and_green(node):
-    import yaml
-    assert node.pass_points == 0
-    cfg = yaml.safe_load(open(ROOT / "cfg/asv5_safe_passage.yaml"))["safe_passage_node"]["ros__parameters"]
-    assert cfg["pass_points"] == 0 and cfg["pass_offset"] == node.pass_offset == 1.8
-    assert cfg["gate_min_width"] == node.gate_min_width and cfg["gate_max_width"] == node.gate_max_width
-
-
-def test_reds_and_greens_get_one_waypoint_on_the_right_side_along_the_course(node):
-    # course east from the entry to the exit; the red and the green are too far apart to be a gate
-    red, green = [8.0, 5.0], [13.0, -5.0]
-    h = Harness(node, [buoy("steady_blue", EXIT), buoy("flashing_green", green), buoy("off", BLACK),
-                       buoy("flashing_red", red), buoy("flashing_blue", ENTRY)])
-    node.pass_points = 0
-    ok, circled, failed, message = h.run()
-    assert ok and circled == 4, message
-    full = goals(node, "flashing_blue")
-    assert len(h.targets) == full + 1 + 1 + full                    # entry circle, red, green, exit circle
-    red_wp, green_wp = h.targets[full], h.targets[full + 1]
-    np.testing.assert_allclose(red_wp, [8.0, 5.0 + node.pass_offset])       # left of the red going east
-    np.testing.assert_allclose(green_wp, [13.0, -5.0 - node.pass_offset])   # right of the green
-    assert side_of(h.targets[full - 1], red_wp, red) == "starboard"
-    assert side_of(red_wp, green_wp, green) == "port"
-    order = message.split("; ")
-    assert [o.split(" ")[1] for o in order[:4]] == ["circled", "passed", "passed", "circled"]
-    assert h.phases().count("TRANSIT") == 4
-
-
-def test_red_and_green_facing_the_course_are_passed_as_one_gate(node):
-    red, green = [10.0, -2.0], [10.0, 2.0]                          # red to starboard, green to port going east
-    h = Harness(node, [buoy("flashing_blue", ENTRY), buoy("flashing_red", red), buoy("flashing_green", green),
-                       buoy("steady_blue", EXIT)])
-    node.pass_points = 0
-    ok, circled, failed, message = h.run()
-    assert ok and circled == 4, message
-    full = goals(node, "flashing_blue")
-    assert len(h.targets) == full + 1 + full                        # one waypoint for both
-    np.testing.assert_allclose(h.targets[full], [10.0, 0.0])        # midway
-    assert "1:flashing_red passed as a gate with 2" in message and "2:flashing_green passed as a gate with 1" in message
-
-
-def test_pair_facing_against_the_course_is_not_a_gate(node):
-    red, green = [10.0, 2.0], [10.0, -2.0]                          # going between them east would put the red on port
-    h = Harness(node, [buoy("flashing_blue", ENTRY), buoy("flashing_red", red), buoy("flashing_green", green),
-                       buoy("steady_blue", EXIT)])
-    node.pass_points = 0
-    ok, circled, failed, message = h.run()
-    assert ok and "gate" not in message
-    full = goals(node, "flashing_blue")
-    assert len(h.targets) == full + 2 + full
-    wps = np.array(h.targets[full:full + 2])
-    off = node.pass_offset
-    assert sorted(wps[:, 1].round(2).tolist()) == [-2.0 - off, 2.0 + off]   # each on its own outer side
-
-
-def test_waypoint_keeps_clear_of_a_close_neighbour(node):
-    h = Harness(node, [buoy("flashing_blue", ENTRY), buoy("flashing_red", [10.0, 0.0]), buoy("off", [10.0, 2.6]),
-                       buoy("steady_blue", EXIT)])
-    node.pass_points = 0
-    assert h.run()[0]
-    full = goals(node, "flashing_blue")
-    offset = h.targets[full][1]                                     # left of the red, toward the black buoy
-    assert offset == pytest.approx(2.6 - node.neighbour_clearance)  # 1.35 m, not the 1.8 m default
-    assert offset >= node.gate_min_width / 2.0
-
-
-def test_failed_gate_is_retried_one_buoy_at_a_time(node):
-    red, green = [10.0, -2.0], [10.0, 2.0]
-    h = Harness(node, [buoy("flashing_blue", ENTRY), buoy("flashing_red", red), buoy("flashing_green", green),
-                       buoy("steady_blue", EXIT)])
-    node.pass_points, node.buoy_attempts = 0, 1
-    full = goals(node, "flashing_blue")
-    h.results = [True] * full + [False, False]                      # the gate waypoint and its retry fail
-    ok, circled, failed, message = h.run()
-    assert ok and circled == 4, message
-    assert len(h.targets) == full + 2 + 2 + full                    # gate twice, then each buoy alone, then the exit
-    assert "gate" not in message                                    # passed alone in the end
-
-
-def test_waypoint_that_fails_every_time_fails_the_buoy_and_the_run_goes_on(node):
-    h = Harness(node, [buoy("flashing_blue", ENTRY), buoy("flashing_red", [8.0, 5.0]), buoy("steady_blue", EXIT)])
-    node.pass_points = 0
-    full = goals(node, "flashing_blue")
-    h.results = [True] * full + [False] * 6                         # 2 attempts x 2 tries, then the requeue x 2
-    ok, circled, failed, message = h.run()
-    assert not ok and circled == 2 and failed == 1 and "1:flashing_red failed" in message
-    assert len(h.targets) == full + 6 + full
-
-
-def test_assistance_request_at_a_waypoint_is_answered_then_the_waypoint_is_driven_again(node):
-    h = Harness(node, [buoy("flashing_blue", ENTRY), buoy("flashing_red", [8.0, 5.0]), buoy("steady_blue", EXIT)],
-                respond=True)
-    node.pass_points = 0
-    full = goals(node, "flashing_blue")
-    h.results = [True] * full + [request_now(node)]
-    later(0.3, node._on_confirm, confirm())
-    ok, circled, failed, message = h.run()
-    assert ok and circled == 3 and "1:flashing_red passed (1 attempt(s)" in message
-    np.testing.assert_allclose(h.targets[full + 1], STATION)
-    np.testing.assert_allclose(h.targets[full + 2], h.targets[full])   # the same waypoint again

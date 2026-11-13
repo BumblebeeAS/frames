@@ -622,9 +622,11 @@ def main(args=None):
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        # Under ros2 launch a Ctrl-C arrives twice (terminal and launch): the second can land in here
         try:
+            executor.shutdown(timeout_sec=1.0)
             node.destroy_node()
-        except Exception:  # Ctrl-C already shut the context down
+        except (Exception, KeyboardInterrupt):
             pass
         rclpy.try_shutdown()
 

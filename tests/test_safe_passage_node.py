@@ -104,6 +104,13 @@ def node(ros):
     n.destroy_node()
 
 
+def goals(node, state="flashing_red"):
+    """TrackPath goals one clean attempt at a buoy takes: the start point, then a semicircle or a full circle."""
+    if state in ("flashing_red", "flashing_green"):
+        return node.pass_points + 1
+    return node.circle_points + node.circle_overshoot_points + 1
+
+
 def swept(points, centre):
     """Signed swept angle (deg) of a run of points about centre: negative is clockwise."""
     angles = np.unwrap([math.atan2(p[1] - centre[1], p[0] - centre[0]) for p in points])
@@ -115,20 +122,27 @@ def test_order_directions_and_point_counts(node):
                        buoy("flashing_red", RED), buoy("flashing_blue", ENTRY)])
     ok, circled, failed, message = h.run()
     assert ok and circled == 4 and failed == 0, message
-    per = node.circle_points + node.circle_overshoot_points + 1  # start point + circle
-    assert len(h.targets) == 4 * per
     # entry, red (x 9), green (x 10), exit; black never circled
     centres = [ENTRY, RED, GREEN, EXIT]
+    states = ["flashing_blue", "flashing_red", "flashing_green", "steady_blue"]
+    assert len(h.targets) == sum(goals(node, s) for s in states)
     order = message.split("; ")
     assert [o.split(" ")[0] for o in order] == ["4:flashing_blue", "3:flashing_red", "1:flashing_green",
                                                 "0:steady_blue"]
-    for n, centre in enumerate(centres):
-        run = h.targets[n * per:(n + 1) * per]
+    assert [o.split(" ")[1] for o in order] == ["circled", "passed", "passed", "circled"]
+    at = 0
+    for n, (centre, state) in enumerate(zip(centres, states)):
+        run = h.targets[at:at + goals(node, state)]
+        at += goals(node, state)
         np.testing.assert_allclose(np.linalg.norm(np.array(run) - centre, axis=1), run and
                                    np.linalg.norm(run[0] - np.array(centre)), atol=1e-6)
-        sigma = 1 if n < 2 else -1
-        full = 360.0 * (1 + node.circle_overshoot_points / node.circle_points)   # the circle plus its overshoot
-        assert swept(run, centre) == pytest.approx(-sigma * full, abs=1e-6)
+        sigma = 1 if n < 2 else -1                               # entry and red clockwise, green and exit not
+        if state in ("flashing_red", "flashing_green"):          # passed: a semicircle on the buoy's side
+            angle = 360.0 * node.pass_points / node.circle_points
+        else:                                                    # circled: all the way round, plus the overshoot
+            angle = 360.0 * (1 + node.circle_overshoot_points / node.circle_points)
+        assert swept(run, centre) == pytest.approx(-sigma * angle, abs=1e-6)
+    assert node.pass_points * 2 == node.circle_points            # the default pass is exactly half a circle
     assert h.phases().count("TRANSIT") == 4
 
 
@@ -145,7 +159,7 @@ def test_failed_point_is_retried_then_skipped(node):
     ok, circled, failed, message = h.run()
     assert ok and circled == 1, message
     np.testing.assert_allclose(h.targets[1], h.targets[2])  # the retry re-sends the same point on a still map
-    assert len(h.targets) == 1 + 2 + (node.circle_points + node.circle_overshoot_points - 1)
+    assert len(h.targets) == 1 + 2 + (goals(node) - 2)
 
 
 def test_two_skips_in_a_row_fail_the_attempt_and_the_second_attempt_starts_over(node):
@@ -169,8 +183,7 @@ def test_failed_red_requeued_once_before_the_exit(node):
     ok, circled, failed, message = h.run()
     assert ok and circled == 2, message  # the requeued attempt succeeded
     np.testing.assert_allclose(np.linalg.norm(h.targets[2] - RED), np.linalg.norm(h.targets[0] - RED))
-    per = node.circle_points + node.circle_overshoot_points + 1
-    assert len(h.targets) == 2 + per + per
+    assert len(h.targets) == 2 + goals(node, "flashing_red") + goals(node, "steady_blue")
     assert np.linalg.norm(h.targets[-1] - EXIT) < 3.0
 
 
@@ -210,7 +223,7 @@ def test_assistance_request_mid_circle_runs_the_core_chain_then_redoes_the_buoy(
     phases = h.phases()
     assert phases.index("INCIDENT_TRANSIT") < phases.index("INCIDENT_ON_STATION")
     assert phases[phases.index("INCIDENT_ON_STATION") + 1] == "TRANSIT"   # the buoy starts over
-    per = node.circle_points + node.circle_overshoot_points + 1
+    per = goals(node)
     np.testing.assert_allclose(h.targets[3], STATION)
     assert len(h.targets) == 3 + 1 + per
     assert node._pending is None and node._incident is None
@@ -480,11 +493,12 @@ def test_layout_is_aligned_to_the_costmap_before_any_driving(node):
     ok, circled, failed, message = h.run()
     assert ok and circled == 4, message
     assert h.phases()[0] == "ALIGN" and "ALIGN" not in h.phases()[h.phases().index("TRANSIT"):]
-    per = node.circle_points + node.circle_overshoot_points + 1
-    for n, i in enumerate([0, 1, 2, 3]):  # entry, red, green, exit
-        run = np.array(h.targets[n * per:(n + 1) * per])
+    at = 0
+    for i in [0, 1, 2, 3]:  # entry, red, green, exit
+        run = np.array(h.targets[at:at + goals(node, STATES[i])])
+        at += goals(node, STATES[i])
         radii = np.linalg.norm(run - (LAYOUT[i] + SHIFT), axis=1)
-        assert radii.max() - radii.min() < 0.15, (i, radii)  # circled around the real buoy, not the drone's
+        assert radii.max() - radii.min() < 0.15, (i, radii)  # around the real buoy, not the drone's
     assert "BLOB" in message
     assert h.goal.feedback[-1].shift_inliers == len(LAYOUT)
     node._aligner, node._buoys = ba.Aligner(LAYOUT, node.align_params), []
@@ -617,7 +631,7 @@ def test_request_during_the_switch_back_is_answered_before_going_on(node):
     assert sent == ["dynamic_incident", "safe_passage", "dynamic_incident", "safe_passage"]
     np.testing.assert_allclose(h.targets[2], STATION)
     np.testing.assert_allclose(h.targets[3], other)
-    per = node.circle_points + node.circle_overshoot_points + 1
+    per = goals(node)
     assert len(h.targets) == 2 + 2 + per                            # the buoy started over once, after both
 
 
@@ -650,7 +664,7 @@ def test_layout_locking_mid_circle_starts_the_buoy_over(node):
     h.results = [True, True, lock_now]
     ok, circled, failed, message = h.run()
     assert ok and circled == 1 and "1 attempt(s)" in message         # the restart is not a failed attempt
-    per = node.circle_points + node.circle_overshoot_points + 1
+    per = goals(node)
     assert h.phases().count("TRANSIT") == 2 and len(h.targets) == 3 + per
     radii = np.linalg.norm(np.array(h.targets[3:]) - shift, axis=1)
     assert radii.max() - radii.min() < 1e-6                           # a whole circle around where it really is
@@ -698,6 +712,6 @@ def test_restart_after_an_incident_keeps_the_blob_a_costmap_misses(node):
     later(0.2, node._on_confirm, confirm())
     ok, circled, failed, message = h.run()
     assert ok and circled == 1 and "BLOB" in message
-    per = node.circle_points + node.circle_overshoot_points + 1
+    per = goals(node)
     radii = np.linalg.norm(np.array(h.targets[-per:]) - truth, axis=1)
     assert radii.max() - radii.min() < 0.15, radii              # the whole restarted circle is around the blob

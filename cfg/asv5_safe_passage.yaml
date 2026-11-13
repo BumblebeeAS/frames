@@ -41,13 +41,15 @@ safe_passage_node:
     estimate_restart_threshold: 1.5  # E_i moving more than this mid-circle (a late lock) starts the buoy over
     buoy_restarts: 2               # at most this often per buoy; after that the points are only re-placed
 
-    # Circle: start point + circle_points per 360 deg + overshoot
+    # Circle (entry, exit): start point + circle_points per 360 deg + overshoot. Pass (red, green): see pass_points
     circle_radius: 2.5
     circle_radius_min: 1.6         # tracker cost boundary ~1.05 m from a buoy mark, plus margin
     circle_radius_step: 0.25
     neighbour_clearance: 1.25      # R <= nearest other buoy - this (robot radius 0.75 + 0.5)
     circle_points: 6               # 60 deg apart: the straight leg between two passes 0.87 x R from the centre
     circle_overshoot_points: 1
+    pass_points: 3                 # reds and greens are passed, not circled: this many steps from the start point
+                                   # (3 x 60 deg = a semicircle), clockwise for red, counterclockwise for green
     cost_threshold: 22             # = tracker sample_cost_threshold: a circle point at or above is blocked
 
     # TrackPath (replan tracker), one goal at a time, specified_heading false, heading along the circle

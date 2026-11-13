@@ -6,7 +6,7 @@ east. sigma is the circling direction: +1 clockwise seen from above, -1 counterc
 
 import math
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -117,11 +117,15 @@ def start_angle(centre, radius: float, boat, sigma: int) -> float:
     return math.atan2(point[1], point[0])
 
 
-def circle_points(centre, radius: float, phi0: float, sigma: int, n: int, overshoot: int = 0) -> list:
-    """[(xy, yaw), ...] for k = 0 .. n + overshoot: point k at phi0 - sigma * k * 2 pi / n, yaw along the travel."""
+def circle_points(centre, radius: float, phi0: float, sigma: int, n: int, overshoot: int = 0,
+                  steps: Optional[int] = None) -> list:
+    """[(xy, yaw), ...] for k = 0 .. n + overshoot: point k at phi0 - sigma * k * 2 pi / n, yaw along the travel.
+
+    steps, when given, replaces n + overshoot: an arc of that many steps of 2 pi / n (n / 2 is a semicircle).
+    """
     centre = np.asarray(centre, dtype=float)[:2]
     out = []
-    for k in range(n + overshoot + 1):
+    for k in range((n + overshoot if steps is None else steps) + 1):
         phi = phi0 - sigma * k * 2.0 * math.pi / n
         out.append((centre + radius * np.array([math.cos(phi), math.sin(phi)]), phi - sigma * math.pi / 2.0))
     return out

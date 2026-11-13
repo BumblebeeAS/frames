@@ -53,6 +53,17 @@ def test_nearest_other():
 
 
 @pytest.mark.parametrize("sigma", [1, -1])
+def test_arc_of_half_the_steps_is_a_semicircle_on_the_same_side(sigma):
+    full = geo.circle_points([1.0, 2.0], 2.5, 0.3, sigma, 6, overshoot=1)
+    half = geo.circle_points([1.0, 2.0], 2.5, 0.3, sigma, 6, overshoot=1, steps=3)
+    assert len(full) == 8 and len(half) == 4
+    for (a, ya), (b, yb) in zip(half, full):                 # the same first points, so the same direction
+        np.testing.assert_allclose(a, b)
+        assert ya == yb
+    np.testing.assert_allclose(half[0][0] + half[-1][0], [2.0, 4.0], atol=1e-9)   # ends opposite the start
+
+
+@pytest.mark.parametrize("sigma", [1, -1])
 def test_circle_points_go_round_in_the_right_direction_with_travel_yaw(sigma):
     points = geo.circle_points([1.0, 2.0], 2.5, 0.0, sigma, 8, overshoot=1)
     assert len(points) == 10

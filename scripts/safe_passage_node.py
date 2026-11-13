@@ -8,7 +8,9 @@ circled one at a time with stop-and-go TrackPath goals:
   TRANSIT  TrackPath to p0, where the boat joins the circle tangentially in the buoy's direction
   CIRCLE   TrackPath to p1 .. pN+overshoot, N points per 360 deg; each goal waits for the previous one's result
 
-Entry and red are circled clockwise (red stays on starboard), green and exit counterclockwise.
+The entry is fully circled clockwise and the exit counterclockwise. Reds and greens only have to be passed on the
+right side, so they get a semicircle: pass_points steps from the same start point, clockwise for red (it stays on
+starboard), counterclockwise for green (on port).
 
 The drone's positions can be metres off as one layout, so before driving the node lines the layout up with the
 costmap (frames.utils.buoy_align): ALIGN holds until the shift locks or align_timeout passes, and the buoys are
@@ -115,7 +117,7 @@ class Buoy:
     state: str
     xy: np.ndarray                      # C_i
     sigma: int = 0                      # +1 clockwise, -1 counterclockwise, 0 never circled
-    status: str = "pending"             # pending | circled | failed
+    status: str = "pending"             # pending | circled (dealt with: circled, or passed for red/green) | failed
     attempts: int = 0
     estimate: Optional[ba.Estimate] = None  # the one the last circle used
     radius: float = 0.0
@@ -151,6 +153,7 @@ class SafePassageNode(Node):
         self.neighbour_clearance = param("neighbour_clearance", 1.25)
         self.circle_points = param("circle_points", 6)
         self.circle_overshoot_points = param("circle_overshoot_points", 1)
+        self.pass_points = param("pass_points", 3)  # reds and greens: 3 of 6 steps is a semicircle
         self.cost_threshold = param("cost_threshold", 22)
 
         # TrackPath
@@ -340,7 +343,8 @@ class SafePassageNode(Node):
             e = b.estimate
             detail = (f", {e.source} {np.linalg.norm(e.xy - b.xy):.2f} m from the drone, R {b.radius:.2f}"
                       if e is not None else "")
-            lines.append(f"{i}:{b.state} {b.status} ({b.attempts} attempt(s){detail})")
+            outcome = self._done_word(b) if b.status == "circled" else b.status
+            lines.append(f"{i}:{b.state} {outcome} ({b.attempts} attempt(s){detail})")
         with self._lock:
             incidents = [f"assistance request {x.seq} {x.state}"
                          + (f" after {x.ended - x.received:.0f} s" if x.ended is not None else "")
@@ -431,7 +435,7 @@ class SafePassageNode(Node):
                 continue
             if ok:
                 buoy.status = "circled"
-                self.get_logger().info(f"{label}: circled")
+                self.get_logger().info(f"{label}: {self._done_word(buoy)}")
                 return
             self.get_logger().warning(f"{label}: failed")
         buoy.status = "failed"
@@ -448,8 +452,12 @@ class SafePassageNode(Node):
         phi0 = geo.start_angle(estimate.xy, radius, boat, buoy.sigma)
         centre = estimate.xy
 
+        # Entry and exit are fully circled; a red or green is passed with a semicircle on its side
+        steps = int(self.pass_points) if buoy.state in (geo.RED, geo.GREEN) else None
+
         def place(c):
-            return geo.circle_points(c, radius, phi0, buoy.sigma, self.circle_points, self.circle_overshoot_points)
+            return geo.circle_points(c, radius, phi0, buoy.sigma, self.circle_points, self.circle_overshoot_points,
+                                     steps)
 
         points = place(centre)
         buoy.estimate, buoy.radius = estimate, radius
@@ -497,6 +505,11 @@ class SafePassageNode(Node):
                 if skips >= self.max_consecutive_skips:
                     return False
         return True
+
+    @staticmethod
+    def _done_word(buoy: Buoy) -> str:
+        """What was done to a buoy that is dealt with: reds and greens are passed, entry and exit circled."""
+        return "passed" if buoy.state in (geo.RED, geo.GREEN) else "circled"
 
     def _estimate(self, buoy: Buoy) -> ba.Estimate:
         """Where the buoy is now. A costmap that misses the blob it was last seen as does not move it."""

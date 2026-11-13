@@ -43,7 +43,7 @@ class AlignParams:
     match_radius: float = 0.75    # m, pairs this close refine the winner
     # Lock
     lock_solves: int = 3          # consecutive accepted solves that must agree before the shift is used
-    lock_tolerance: float = 1.0   # m, how far apart they may be
+    lock_tolerance: float = 0.5   # m, how far apart they may be (1.0 locked up to 1.5 m off while localisation wobbled)
     basin: float = 2.0            # m, once locked only shifts this close to the locked one are searched
     median_window: int = 10       # solves the locked shift is the median of
     # Estimates

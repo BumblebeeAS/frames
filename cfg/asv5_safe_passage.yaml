@@ -28,7 +28,7 @@ safe_passage_node:
     match_radius: 0.75             # pairs this close refine the winner (least squares) and count as matched
     # Lock: the shift is used once consecutive accepted solves agree; then it is the median of recent nearby solves
     lock_solves: 3
-    lock_tolerance: 1.0
+    lock_tolerance: 0.5            # 1.0 locked up to 1.5 m off while the costmap wobbled with localisation
     basin: 2.0                     # once locked, only shifts this close to the locked one are searched
     median_window: 10
     align_timeout: 30.0            # ALIGN holds this long for a lock, then goes on with the drone's positions as is

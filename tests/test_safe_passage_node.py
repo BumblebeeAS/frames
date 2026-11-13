@@ -584,16 +584,37 @@ def clear(node):
 
 
 def test_request_with_no_goal_running_is_held_and_answered_first_by_the_next_goal(node):
-    node._on_assistance(assistance(seq=30))               # nothing running: held, however long
-    node._held.received -= 3600.0                         # an hour ago: no time limit
+    node._on_assistance(assistance(seq=30))               # nothing running: held
+    node._held.received -= 20.0                           # 20 s ago: still within assistance_max_age
     assert node._pending is None and node._held.seq == 30
     h = Harness(node, respond=True)
     later(0.2, node._on_confirm, confirm())
     ok, circled, failed, message = h.run()
-    assert ok and circled == 2 and "assistance request 30 confirmed after 36" in message
+    assert ok and circled == 2 and "assistance request 30 confirmed after 2" in message
     assert h.acks == [30] and h.reports == [30] and node._held is None
     np.testing.assert_allclose(h.targets[0], STATION)     # before anything else, ALIGN included
     assert h.stages()[:3] == ["INCIDENT_TRANSIT", "INCIDENT_ON_STATION", "ALIGN"]   # nothing to go back to
+
+
+def test_held_request_older_than_the_limit_is_discarded(node):
+    node._on_assistance(assistance(seq=30))
+    node._held.received -= 31.0                           # the goal starts 31 s after it arrived
+    h = Harness(node, respond=True)
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 2 and "assistance request 30 expired" in message
+    assert h.acks == [] and h.reports == [] and h.tasks == [] and node._held is None
+    assert "INCIDENT_TRANSIT" not in h.phases()
+    assert node.assistance_max_age == 30.0
+
+
+def test_no_limit_when_the_age_gate_is_off(node):
+    node.assistance_max_age = 0.0
+    node._on_assistance(assistance(seq=30))
+    node._held.received -= 3600.0
+    h = Harness(node, respond=True)
+    later(0.2, node._on_confirm, confirm())
+    ok, circled, failed, message = h.run()
+    assert ok and "assistance request 30 confirmed after 36" in message and h.acks == [30]
 
 
 def test_clear_assistance_drops_a_held_request(node):

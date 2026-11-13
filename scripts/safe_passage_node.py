@@ -26,8 +26,8 @@ ReadinessReport once there, and holds (the boat station-keeps without a goal) un
 report arrives or readiness_confirm_timeout passes. Then it drives back to where it was interrupted
 (incident_return), switches the task back and goes on: ALIGN resumes; anything later goes back to PLAN, with the
 entry loop if it had not closed and without it if it had. Requests are taken once per seq; a newer request replaces
-the one in hand. A request that arrives while no goal answers them is held, with no time limit, and answered first
-by the next goal that does. The clear_assistance service (std_srvs/Trigger) drops a held request: the mission tree
+the one in hand. A request that arrives while no goal answers them is held and answered first by the next goal that
+does, unless that goal starts more than assistance_max_age after the request was received: then it is discarded. The clear_assistance service (std_srvs/Trigger) drops a held request: the mission tree
 calls it at run start, so nothing from before the run is acted on. The hold is in memory only, so a relaunched node
 starts without one.
 
@@ -105,7 +105,7 @@ class Incident:
     received: float                     # monotonic
     state: str = "received"             # received | transit | on_station | then how it ended:
     #                                     confirmed | confirm_timeout | unreachable | report_failed | no_position |
-    #                                     superseded | canceled
+    #                                     superseded | canceled | expired
     report_seq: Optional[int] = None    # seq of the report that carried our ReadinessReport
     report_unsure: bool = False         # a try at that report failed: it may still have reached RoboCommand
     on_station: Optional[float] = None  # monotonic, when the boat got there
@@ -180,6 +180,7 @@ class SafePassageNode(Node):
 
         # Task 4 Core
         self.hold_idle_requests = param("hold_idle_requests", True)
+        self.assistance_max_age = param("assistance_max_age", 30.0)  # s from receipt to starting on it; 0: no limit
         self.readiness_confirm_timeout = param("readiness_confirm_timeout", 900.0)
         self.incident_goal_retries = param("incident_goal_retries", 2)
         self.incident_sample_radius = param("incident_sample_radius", 0.5)
@@ -706,6 +707,14 @@ class SafePassageNode(Node):
                     self._incident = incident
                 if incident is None:
                     break
+                age = time.monotonic() - incident.received
+                if self.assistance_max_age > 0.0 and age > self.assistance_max_age:
+                    with self._lock:  # too old to start on: no ack, no task switch, the boat stays on its course
+                        self._end(incident, "expired")
+                        self._incident = None
+                    self.get_logger().warning(f"Assistance request {incident.seq}: received {age:.0f} s ago, more "
+                                              f"than {self.assistance_max_age:.0f} s: discarded")
+                    continue
                 answered = True
                 try:
                     outcome = self._respond_to(goal_handle, incident, total)

@@ -71,7 +71,9 @@ safe_passage_node:
     # Task 4 Core (goal respond_to_assistance): an AssistanceRequest for this vehicle type interrupts the goal.
     # IncidentAck + SetTask go out, the boat drives to the position, sends the ReadinessReport, holds for the
     # ReadinessConfirm naming that report, then drives back to where it was interrupted, SetTask back, and PLAN.
-    hold_idle_requests: true       # a request with no goal answering is held, with no time limit, for the next goal
+    hold_idle_requests: true       # a request with no goal answering is held for the next goal ...
+    assistance_max_age: 30.0       # ... which discards it if it was received more than this long before the
+                                   # node starts on it (by this node's clock, from when it arrived here). 0: no limit
     clear_assistance_service: "/asv5/safe_passage/clear_assistance"  # Trigger: drops it (the tree, at run start)
     vehicle_id: "USV1"             # as the OCS names this vehicle: ReadinessConfirms for another id are ignored
     vehicle_type: "usv"            # AssistanceRequests for another type are ignored

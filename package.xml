@@ -25,6 +25,7 @@
     <depend version_gte="0.0.2">bb_planner_msgs</depend>
     <depend>bb_controls_msgs</depend>
     <depend>nav2_msgs</depend>
+    <depend>std_msgs</depend>
     <depend>std_srvs</depend>
 
     <depend>eigen</depend>
@@ -39,6 +40,7 @@
     <exec_depend>tf_transformations</exec_depend>
     <exec_depend>python3-numpy</exec_depend>
     <exec_depend>python3-yaml</exec_depend>
+    <exec_depend>python3-shapely</exec_depend>
     <!-- Use the pip-installed version instead of the system version -->
     <!-- Ubuntu 22.04 uses python3-transforms3d version 0.3.1 -->
     <!-- This has a `numpy.float` bug which is incompatible with numpy 1.24+ -->

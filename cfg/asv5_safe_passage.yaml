@@ -47,6 +47,9 @@ safe_passage_node:
     neighbour_clearance: 1.25      # R <= nearest other buoy - this (robot radius 0.75 + 0.5)
     circle_points: 6               # goals per lap, 60 deg apart
     plan_retry_period: 2.0         # no route: planned again this long after, on the costmap of then, with no limit
+    fallback_planner: true         # no full route from the lattice: the sampling planner is asked, the better route kept
+    fallback_budget: 10.0          # s of sampling per ask (it stops early on a good route); its checks come on top
+    lattice_every: 5               # after no route the lattice sits out the attempts between (same field, same answer)
     # What the planner is told about the field
     blob_sigma: 0.3                # position error of a buoy on its costmap blob
     predicted_sigma: 1.0           # ... of one with no blob, at its shifted drone position: a wider berth, and it

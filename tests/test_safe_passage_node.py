@@ -32,6 +32,7 @@ import importlib.util  # noqa: E402
 from frames.utils import buoy_align as ba  # noqa: E402
 from frames.utils import safe_passage_geometry as geo  # noqa: E402
 from frames.utils import safe_route as sr  # noqa: E402
+from frames.utils import safe_route_rrt as srr  # noqa: E402
 
 spec = importlib.util.spec_from_file_location("safe_passage_node", ROOT / "scripts/safe_passage_node.py")
 spn = importlib.util.module_from_spec(spec)
@@ -132,6 +133,7 @@ class Harness:
         node.route_params = replace(node.route_params, mc_trials=0, choose="strictest")  # one search per plan
         node.align_timeout = 0.0  # one buoy-sized blob per buoy and no shift: go straight on
         node.plan_retry_period = 0.05
+        node.fallback_planner = False  # the lattice alone, unless a test asks for the sampler
         node.readiness_confirm_timeout = 5.0
 
     def _run_action(self, gh, client, name, goal, timeout, ok):
@@ -380,6 +382,75 @@ def test_no_route_is_planned_again_until_there_is_one(node):
     finally:
         sr.plan_route = inner
     assert ok and circled == 2 and "3 plan(s)" in message and h.phases().count("PLAN") == 3
+
+
+def sampler_stub(monkeypatch, answer):
+    """The sampler answers with answer(lattice's own route for the same ask); its calls are returned."""
+    calls = []
+
+    def sample(buoys, params=None, obstacles=None, **k):
+        calls.append(dict(k))
+        k.pop("time_budget")
+        return answer(_plan_route(buoys, params, obstacles, **k))
+
+    monkeypatch.setattr(srr, "plan_route", sample)
+    return calls
+
+
+def test_sampler_is_asked_when_the_lattice_has_no_route(node, monkeypatch):
+    h = Harness(node)
+    node.fallback_planner = True
+    calls = sampler_stub(monkeypatch, lambda plan: plan)
+    monkeypatch.setattr(sr, "plan_route", lambda *a, **k: sr.RoutePlan("no_route", "nothing"))
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 2 and "route ok by the sampler" in message and "1 plan(s)" in message
+    assert len(calls) == 1 and calls[0]["time_budget"] == node.fallback_budget
+
+
+def test_the_sampler_itself_is_driven_like_any_route(node, monkeypatch):
+    h = Harness(node)
+    node.fallback_planner, node.fallback_budget = True, 2.0
+    monkeypatch.setattr(sr, "plan_route", lambda *a, **k: sr.RoutePlan("no_route", "nothing"))
+    ok, circled, failed, message = h.run()
+    assert ok and circled == 2 and failed == 0 and "route ok by the sampler" in message
+    assert "red to starboard yes, green to port yes" in message and "1 plan(s)" in message
+    assert h.phases()[:2] == ["ALIGN", "PLAN"] and {"ENTRY", "TRANSIT", "EXIT"} <= set(h.phases())
+
+
+def test_sampler_route_is_kept_only_when_it_is_better(node, monkeypatch):
+    h = Harness(node)
+    node.fallback_planner = True
+
+    def partial(plan):
+        return replace(plan, status="ok_partial")
+
+    lattice = sr.plan_route
+    monkeypatch.setattr(sr, "plan_route", lambda *a, **k: partial(lattice(*a, **k)))
+    calls = sampler_stub(monkeypatch, partial)                 # no better: the lattice's partial route is driven
+    assert "route ok_partial by the lattice" in h.run()[3] and len(calls) == 1
+    calls = sampler_stub(monkeypatch, lambda plan: plan)       # a full route: the sampler's
+    h = Harness(node)
+    node.fallback_planner = True
+    assert "route ok by the sampler" in h.run()[3] and len(calls) == 1
+
+
+def test_sampler_is_not_asked_when_the_lattice_has_a_full_route(node, monkeypatch):
+    h = Harness(node)
+    node.fallback_planner = True
+    calls = sampler_stub(monkeypatch, lambda plan: plan)
+    assert "route ok by the lattice" in h.run()[3] and not calls
+
+
+def test_lattice_sits_out_the_attempts_after_a_miss(node, monkeypatch):
+    h = Harness(node)
+    node.fallback_planner, node.lattice_every = True, 3
+    asked = []
+    monkeypatch.setattr(sr, "plan_route", lambda *a, **k: (asked.append(1), sr.RoutePlan("no_route", "nothing"))[1])
+    misses = [1, 1, 1, 1]
+    calls = sampler_stub(monkeypatch, lambda plan: sr.RoutePlan("no_route", "nothing") if misses and misses.pop()
+                         else plan)
+    ok, circled, failed, message = h.run()
+    assert ok and "5 plan(s)" in message and len(calls) == 5 and len(asked) == 2   # attempts 1 and 4
 
 
 def test_planner_fault_is_planned_again(node):

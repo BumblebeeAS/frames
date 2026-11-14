@@ -117,3 +117,14 @@ def test_resume_on_the_exit_circle_goes_round_it():
     assert math.dist(plan.waypoints[0][:2], (3.0, 20.0)) < 0.5
     full = sr.plan_route(buoys, RouteParams(), start=(3.0, 20.0), need_red=False, need_green=False)   # Monte Carlo on
     assert full.status == "ok" and full.exit_circle
+
+
+def test_sampler_has_the_same_interface_and_a_compliant_route():
+    from frames.utils import safe_route_rrt as srr
+    for kwargs in ({}, {"start": (0.4, 3.2)}):
+        plan = srr.plan_route(channel(), RouteParams(**FAST), seed=3, time_budget=2.0, **kwargs)
+        assert plan.status == "ok" and plan.exit_circle and bool(plan.entry_circle) == (not kwargs)
+        assert [g[3] for g in plan.goals][-1] == "exit"
+        res = literal(plan.waypoints, channel(), plan.start_yaw if not kwargs else None)
+        assert res.compliant and res.red_credits and res.green_credits
+    assert srr.plan_route(channel(entry=False), RouteParams(**FAST)).status == "missing_entry"

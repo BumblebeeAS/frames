@@ -9,7 +9,9 @@ dropped on arrival. The run is one route (frames.utils.safe_route), driven as st
            passes: the drone's positions can be metres off as one layout. Without a lock the shift is zero.
   PLAN     hold while the planner routes the whole run on the buoys where they are now believed to be: each drone
            buoy on its costmap blob, else at its shifted drone position; buoy-sized blobs the drone did not report
-           and larger structures are kept clear of. No route: planned again every plan_retry_period, with no limit.
+           and larger structures are kept clear of. No full route from the lattice: the sampling planner
+           (frames.utils.safe_route_rrt) is asked and the better route kept. No route: planned again every
+           plan_retry_period, with no limit, by the sampler, and by the lattice too every lattice_every attempts.
   ENTRY    the entry loop, clockwise, from a point the planner chose back to that point
   TRANSIT  from there to the exit circle, never a red to port or a green to starboard, passing at least one red to
            starboard and one green to port where the field allows; one goal per corner
@@ -66,6 +68,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 from frames.utils import buoy_align as ba
 from frames.utils import safe_passage_geometry as geo
 from frames.utils import safe_route as sr
+from frames.utils import safe_route_rrt as srr
 
 # nav2 costmaps publish reliable transient local
 LATCHED_QOS = QoSProfile(
@@ -160,6 +163,10 @@ class SafePassageNode(Node):
             circle_points=int(param("circle_points", 6)),
         )
         self.plan_retry_period = param("plan_retry_period", 2.0)
+        # The sampling planner (frames/utils/safe_route_rrt.py), asked when the lattice has no full route
+        self.fallback_planner = param("fallback_planner", True)
+        self.fallback_budget = param("fallback_budget", 10.0)  # s of search per ask; its checks come on top
+        self.lattice_every = param("lattice_every", 5)         # after a miss the lattice sits out the attempts between
         # What the planner is told about the field
         self.blob_sigma = param("blob_sigma", 0.3)            # m, position error of a buoy on its costmap blob
         self.predicted_sigma = param("predicted_sigma", 1.0)  # ... of one at its shifted drone position
@@ -219,6 +226,7 @@ class SafePassageNode(Node):
         self._circle: list = []      # [(xy, yaw)] the goals of the route being driven, for markers
         self._target: Optional[np.ndarray] = None
         self._logged_t = np.zeros(2)
+        self._route_planner = ""                      # which planner the route in hand came from
         self._route_buoys: list = []                  # what the route in hand was planned on (safe_route.Buoy)
         self._route_level = 0                         # ... and the planner's margin level that produced it
         self._tracker: Optional[sr.PassTracker] = None  # set while passes count, fed the boat's pose by a timer
@@ -347,7 +355,8 @@ class SafePassageNode(Node):
 
         done = [name for name, flag in (("entry loop", progress.entry_done), ("exit circle", progress.exit_done))
                 if flag]
-        lines = [f"route {route.status}" + (f" ({route.message})" if route.message else ""),
+        lines = [f"route {route.status} by the {self._route_planner}"
+                 + (f" ({route.message})" if route.message else ""),
                  "driven: " + (", ".join(done) or "no circle"),
                  f"red to starboard {'yes' if progress.red else 'no'}, green to port "
                  f"{'yes' if progress.green else 'no'}",
@@ -432,36 +441,60 @@ class SafePassageNode(Node):
     def _plan(self, goal_handle, buoys: list, progress: Progress, total: int) -> sr.RoutePlan:
         """PLAN: hold until the planner returns a route, one attempt per plan_retry_period, with no limit: each
         attempt sees the costmap of its moment. Raises Assistance or Canceled."""
+        attempt = 0
         while True:
             self._feedback(goal_handle, "PLAN", total)
             inputs, obstacles = self._planner_inputs(buoys, self._snapshot())
+            # The lattice gives the same answer on the same field and takes long to say no: after a miss the
+            # attempts in between are the sampler's alone, which searches differently every time
+            lattice = not self.fallback_planner or attempt % max(1, int(self.lattice_every)) == 0
             # The entry loop is done, or there is no entry buoy: the route starts where the boat is
             from_boat = progress.entry_done or not any(b.state == sr.ENTRY for b in inputs)
             start = self._boat_xy() if from_boat else None
             box = {}
             if start is not None or not from_boat:
                 progress.plans += 1
+                attempt += 1
                 started = time.monotonic()
 
                 def work():
-                    try:
-                        box["plan"] = sr.plan_route(inputs, self.route_params, obstacles, start=start,
-                                                    need_red=not progress.red, need_green=not progress.green)
-                    except Exception as e:  # noqa: BLE001  a planner fault must not end the goal: it is tried again
-                        box["error"] = repr(e)
+                    ask = dict(start=start, need_red=not progress.red, need_green=not progress.green)
+                    rank = {"ok": 2, "ok_partial": 1}
+                    planners = [("lattice", lambda: sr.plan_route(inputs, self.route_params, obstacles, **ask))]
+                    if self.fallback_planner:
+                        planners.append(("sampler", lambda: srr.plan_route(
+                            inputs, self.route_params, obstacles, **ask, time_budget=float(self.fallback_budget))))
+                    for name, planner in planners[0 if lattice else 1:]:
+                        held = box.get("plan")
+                        if box.get("dropped") or (held is not None
+                                                  and held.status not in ("no_route", "ok_partial")):
+                            break             # a full route, or a field the sampler reads the same way
+                        try:
+                            plan = planner()
+                        except Exception as e:  # noqa: BLE001  a planner fault must not end the goal: tried again
+                            box["error"] = f"{name}: {e!r}"
+                            continue
+                        # The sampler's route is taken only when it is the better one: full over partial over none
+                        if held is None or rank.get(plan.status, 0) > rank.get(held.status, 0):
+                            box["plan"], box["planner"] = plan, name
 
                 worker = threading.Thread(target=work, name="safe_passage_plan", daemon=True)
                 worker.start()
                 # Not waited for when interrupted: the thread finishes on its own and its route is dropped
-                self._wait(goal_handle, lambda: self._check(goal_handle) or not worker.is_alive(), math.inf)
+                try:
+                    self._wait(goal_handle, lambda: self._check(goal_handle) or not worker.is_alive(), math.inf)
+                except BaseException:
+                    box["dropped"] = True     # interrupted: the planner that is running is the thread's last
+                    raise
+                if box.get("error"):
+                    self.get_logger().error(f"Plan {progress.plans}: planner failed ({box['error']})")
                 plan = box.get("plan")
                 where = "the entry loop" if start is None else f"({start[0]:.2f}, {start[1]:.2f})"
-                if plan is None:
-                    self.get_logger().error(f"Plan {progress.plans} from {where}: planner failed ({box.get('error')})")
-                else:
+                if plan is not None:
                     counts = [sum(g[3] == phase for g in plan.goals) for phase in ("entry", "transit", "exit")]
                     self.get_logger().info(
-                        f"Plan {progress.plans} from {where}: {plan.status} in {time.monotonic() - started:.1f} s; "
+                        f"Plan {progress.plans} from {where}: {plan.status} by the {box['planner']} in "
+                        f"{time.monotonic() - started:.1f} s; "
                         f"{len(inputs)} objects ({sum(b.confirmed and b.state != sr.UNKNOWN for b in inputs)} drone "
                         f"buoys on a blob, {sum(b.state == sr.UNKNOWN for b in inputs)} blobs the drone did not "
                         f"report), {len(obstacles)} obstacle cells; goals entry {counts[0]}, transit {counts[1]}, "
@@ -473,6 +506,7 @@ class SafePassageNode(Node):
                         with self._lock:
                             self._route_buoys = inputs
                             self._route_level = max(plan.level, 0)
+                            self._route_planner = box["planner"]
                             self._circle = [(np.array(g[:2]), g[2]) for g in plan.goals]
                         return plan
             self._wait(goal_handle, lambda: self._check(goal_handle) or False, self.plan_retry_period)
